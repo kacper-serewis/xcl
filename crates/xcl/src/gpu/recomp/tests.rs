@@ -4,7 +4,7 @@
 //! as wave32 programs, and only need a GPU and DXC.
 
 use super::runner::{self, KernelState};
-use super::{translate, Mode, Options};
+use super::{translate, Mode, Options, PadWaves};
 use crate::gpu::rdna2::encode;
 
 /// A GPU and DXC for the instruction tests. Wave64 programs run natively where the adapter
@@ -8345,4 +8345,322 @@ fn fssm_waves_match_the_model(flags: u32, lanes: u32, split: bool) {
         }
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+// ---- compute groups that are not whole waves ----
+
+fn cs_of(threads: [u32; 3], tg_size: bool) -> super::CsInterface {
+    super::CsInterface { threads, user_sgprs: 4, tgid: [true, false, false], tg_size, tid_components: 3 }
+}
+
+/// A compute program that can tell the lanes its last, partial wave did not launch
+/// (`partial_waves`): on the console they exist, inactive – code that turns them on in EXEC
+/// runs in them (a compare of a register with itself is true there whatever it holds, `v_mov`
+/// writes them) and `v_writelane` writes them whatever EXEC is. v0 = thread index in the
+/// group (s1 = x, s2 = x · y of the group). Each thread stores at s0 + 16 · thread: the bits
+/// of `v_cmp_eq_u32 vcc, v0, v0` after `s_not exec, exec` and after `s_or_saveexec s, -1`,
+/// the wave's last lane of a VGPR written with EXEC = -1, and a lane `v_writelane` wrote.
+fn lanes_not_launched_program(wave64: bool) -> Vec<u8> {
+    let (b, last) = if wave64 { ("B64", 63) } else { ("B32", 31) };
+    let s1 = |n: &str, d: u64, s: u64| ins(&format!("{n}_{b}"), "ENC_SOP1", &[("SDST", d), ("SSRC0", s)], None);
+    let all = || ins("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", V), ("VSRC1", 0)], None);
+    let lane = |n: &str, d: u64, s: u64, l: u64| ins(n, "ENC_VOP3", &[("VDST", d), ("SRC0", s), ("SRC1", 128 + l)], None);
+    let mut parts = vec![
+        ins("V_MAD_U32_U24", "ENC_VOP3", &[("VDST", 20), ("SRC0", V + 1), ("SRC1", 1), ("SRC2", V)], None),
+        ins("V_MAD_U32_U24", "ENC_VOP3", &[("VDST", 0), ("SRC0", V + 2), ("SRC1", 2), ("SRC2", V + 20)], None),
+        s1("S_MOV", 30, 126),
+        s1("S_NOT", 126, 126),
+        all(),
+        s1("S_BCNT1_I32", 20, 106),
+        s1("S_MOV", 126, 30),
+        s1("S_OR_SAVEEXEC", 12, 193),
+        all(),
+        s1("S_BCNT1_I32", 21, 106),
+        ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 135)], None),
+        s1("S_MOV", 126, 30),
+        lane("V_READLANE_B32", 22, V + 9, last),
+        lane("V_WRITELANE_B32", 10, 128 + 33, last - 1),
+        lane("V_READLANE_B32", 23, V + 10, last - 1),
+    ];
+    for k in 0..4 {
+        parts.push(ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 24 + k), ("SRC0", 20 + k)], None));
+    }
+    parts.extend([
+        ins("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 30), ("SRC0", 132), ("VSRC1", 0)], None),
+        ins("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 30), ("SRC0", 0), ("VSRC1", 30)], None),
+        ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 31), ("SRC0", 128)], None),
+        ins("GLOBAL_STORE_DWORDX4", "ENC_FLAT_GLBL", &[("ADDR", 30), ("DATA", 24), ("SADDR", 0x7D)], None),
+    ]);
+    program_of(&parts)
+}
+
+/// Runs `lanes_not_launched_program` in groups of each of `groups`' dimensions: one line per
+/// console wave whose threads did not all store what the console's would (the ISA's
+/// definition, not a measurement), and per group in which a thread the console does not
+/// have stored anything.
+fn lanes_not_launched_mismatches(groups: &[[u32; 3]], wave64: bool, pad_waves: PadWaves) -> Vec<String> {
+    let (base, lanes) = (0x100usize, if wave64 { 64 } else { 32 });
+    let code = lanes_not_launched_program(wave64);
+    let mut bad = Vec::new();
+    for &dims in groups {
+        let threads = dims.iter().product::<u32>();
+        let t = translate(&code, &on_gpu(Options { mode: Mode::Compute(cs_of(dims, false)), wave64, pad_waves, ..Default::default() })).unwrap();
+        assert!(t.complete(), "{dims:?}: {:?}", t.unsupported_why);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{dims:?}: {e}"));
+        let mem = vec![0xDEAD_BEEFu32; (base + threads.next_multiple_of(lanes) as usize * 16) / 4];
+        let out = runner::dispatch(&dxil, [1, 1, 1], &[base as u32, dims[0], dims[0] * dims[1]], &mem).unwrap_or_else(|e| panic!("{dims:?}: {e}"));
+        for w in 0..threads.div_ceil(lanes) {
+            let n = (threads - w * lanes).min(lanes);
+            let want = [lanes - n, lanes, 7, 33];
+            let mut got: Vec<[u32; 4]> = (w * lanes..w * lanes + n).map(|tid| out[base / 4 + tid as usize * 4..][..4].try_into().unwrap()).collect();
+            got.dedup();
+            if got != [want] {
+                bad.push(format!("{pad_waves:?} | group {dims:?} wave {w} ({n} lanes) | want {want:?} | got {got:?}"));
+            }
+        }
+        if out[base / 4 + threads as usize * 4..].iter().any(|&x| x != 0xDEAD_BEEF) {
+            bad.push(format!("{pad_waves:?} | group {dims:?}: a thread past the group's {threads} stored"));
+        }
+    }
+    bad
+}
+
+/// A wave64 compute group that is not whole waves, for a program that can tell: before, a
+/// group of 40 threads counted no lane after `s_not_b64 exec, exec` (24 on the console) and
+/// 40 after `s_or_saveexec_b64 s, -1` (64), and lost what it wrote to lane 62. In 1-D, 2-D
+/// and 3-D groups; without the padding lanes (`PadWaves::Never`: the translation as it was)
+/// each of the 11 partial waves differs.
+#[test]
+fn gpu_wave64_valu_code_in_lanes_not_launched() {
+    if !gpu_ready() {
+        return;
+    }
+    let groups = [[64, 1, 1], [40, 1, 1], [42, 1, 1], [20, 1, 1], [10, 1, 1], [96, 1, 1], [8, 5, 1], [4, 5, 2], [6, 7, 1], [2, 5, 1], [8, 12, 1], [1, 1, 1]];
+    let bad = lanes_not_launched_mismatches(&groups, true, PadWaves::WhereSeen);
+    assert!(bad.is_empty(), "{bad:#?}");
+    let before = lanes_not_launched_mismatches(&groups, true, PadWaves::Never);
+    assert_eq!(before.len(), 11, "{before:#?}");
+}
+
+/// The same for wave32 programs: groups of 20, 10, 52 (a full wave and 20 lanes), 5 x 4 and
+/// 1 threads; a group of 32 is a whole wave.
+#[test]
+fn gpu_wave32_valu_code_in_lanes_not_launched() {
+    if !gpu_ready() {
+        return;
+    }
+    let groups = [[32, 1, 1], [20, 1, 1], [10, 1, 1], [52, 1, 1], [5, 4, 1], [1, 1, 1]];
+    let bad = lanes_not_launched_mismatches(&groups, false, PadWaves::WhereSeen);
+    assert!(bad.is_empty(), "{bad:#?}");
+    let before = lanes_not_launched_mismatches(&groups, false, PadWaves::Never);
+    assert_eq!(before.len(), 5, "{before:#?}");
+}
+
+/// A 64-bit saveexec to null that turns lanes on (@JGonzalezRodriguez's case): with EXEC_HI 0,
+/// `s_or_saveexec_b64 null, 0xFFFFFFFF` in a group of 20 threads turns on lanes 20..31, and a
+/// compare of a register with itself counts 32 lanes on the console. When the null write
+/// hid this from `partial_waves`, the group was not padded and the count was 20.
+#[test]
+fn gpu_wave64_saveexec_to_null_turns_on_lanes_not_launched() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = program_of(&[
+        ins("S_MOV_B64", "ENC_SOP1", &[("SDST", 30), ("SSRC0", 126)], None),
+        ins("S_MOV_B32", "ENC_SOP1", &[("SDST", 127), ("SSRC0", 128)], None),
+        ins("S_OR_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 125), ("SSRC0", 255)], Some(!0)),
+        ins("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", V), ("VSRC1", 0)], None),
+        ins("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 20), ("SSRC0", 106)], None),
+        ins("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 30)], None),
+        ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 20)], None),
+        ins("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 130), ("VSRC1", 0)], None),
+        ins("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 0), ("VSRC1", 2)], None),
+        ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 128)], None),
+        ins("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 2), ("DATA", 1), ("SADDR", 0x7D)], None),
+    ]);
+    let base = 0x100usize;
+    let run = |pad_waves: PadWaves| -> Vec<u32> {
+        let t = translate(&code, &on_gpu(Options { mode: Mode::Compute(cs_of([20, 1, 1], false)), wave64: true, pad_waves, ..Default::default() })).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+        let out = runner::dispatch(&dxil, [1, 1, 1], &[base as u32, 20, 20], &vec![0u32; base / 4 + 64]).unwrap();
+        out[base / 4..base / 4 + 20].to_vec()
+    };
+    assert_eq!(run(PadWaves::WhereSeen), [32; 20]);
+    assert_eq!(run(PadWaves::Never), [20; 20], "the unpadded group, for comparison");
+}
+
+/// Only a program that can tell gets the padded group (`partial_waves`), and only in a group
+/// that is not whole waves: every other translation is the one it was.
+#[test]
+fn compute_groups_are_padded_only_where_the_program_can_tell() {
+    // the switches (for comparison) replace `WhereSeen`
+    if std::env::var_os("XCL_CS_PAD_ALL").is_some() || std::env::var_os("XCL_NO_CS_PAD").is_some() {
+        return;
+    }
+    // an if block: EXEC stays inside the launched lanes
+    let plain = prog(&[
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", V), ("VSRC1", 1)], None),
+        ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 106)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 129)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 6)], None),
+    ]);
+    let wide = lanes_not_launched_program(true);
+    let hlsl = |code: &[u8], dims: [u32; 3], wave64: bool, split: bool, pad: PadWaves| {
+        let t = translate(code, &Options { mode: Mode::Compute(cs_of(dims, false)), wave64, split_wave64: split, pad_waves: pad, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        t.hlsl
+    };
+    for split in [false, true] {
+        for dims in [[40, 1, 1], [8, 5, 1], [96, 1, 1], [1, 1, 1]] {
+            let h = hlsl(&plain, dims, true, split, PadWaves::WhereSeen);
+            assert!(h.contains(&format!("[numthreads({}, {}, {})]", dims[0], dims[1], dims[2])) && h.contains("(true); exec_lo = e0.x;"), "{dims:?}");
+            assert_eq!(h, hlsl(&plain, dims, true, split, PadWaves::Never), "{dims:?}");
+        }
+        // one that can: whole waves, the lanes past its threads inactive at the start
+        for (dims, padded, threads) in [([40, 1, 1], 64, 40), ([8, 5, 1], 64, 40), ([1, 1, 1], 64, 1), ([4, 4, 6], 128, 96), ([1000, 1, 1], 1024, 1000)] {
+            let h = hlsl(&wide, dims, true, split, PadWaves::WhereSeen);
+            assert!(h.contains(&format!("[numthreads({padded}, 1, 1)]")) && h.contains(&format!("(gi < {threads}u); exec_lo = e0.x;")), "{dims:?}");
+            // the split form's halves both exist then
+            assert_eq!(h.contains(&format!("#define XCL_X_THREADS {padded}u")), split, "{dims:?}");
+        }
+        // whole waves are never padded
+        for dims in [[64, 1, 1], [8, 8, 4]] {
+            assert_eq!(hlsl(&wide, dims, true, split, PadWaves::Always), hlsl(&wide, dims, true, split, PadWaves::Never), "{dims:?}");
+        }
+    }
+    // a wave32 program's waves have 32 lanes
+    let h = hlsl(&lanes_not_launched_program(false), [20, 1, 1], false, false, PadWaves::WhereSeen);
+    assert!(h.contains("[numthreads(32, 1, 1)]") && h.contains("(gi < 20u); exec_lo = e0.x;"));
+}
+
+/// `s_barrier` in a padded group counts the group's hardware waves with its padding: split
+/// wave64 runs a group of 32 threads or fewer, padded to 64, as two hardware waves, and the
+/// barrier keeps its group sync (the early-exit-safe form) as for any group of two.
+#[test]
+fn a_padded_group_barrier_counts_its_padding_waves() {
+    if std::env::var_os("XCL_SAFE_BARRIER").is_some() {
+        return;
+    }
+    let code = prog(&[("S_BARRIER", "ENC_SOPP", &[], None)]);
+    let hlsl = |dims: [u32; 3], split: bool, pad: PadWaves| {
+        let t = translate(&code, &Options { mode: Mode::Compute(cs_of(dims, false)), wave64: true, split_wave64: split, pad_waves: pad, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        t.hlsl
+    };
+    // padded to 64 threads: two 32-lane waves split, one 64-lane wave otherwise
+    for (dims, split, pad, waves) in [
+        ([20, 1, 1], true, PadWaves::Always, 2),
+        ([1, 1, 1], true, PadWaves::Always, 2),
+        ([40, 1, 1], true, PadWaves::Always, 2),
+        ([20, 1, 1], true, PadWaves::Never, 1),
+        ([20, 1, 1], false, PadWaves::Always, 1),
+    ] {
+        let h = hlsl(dims, split, pad);
+        assert_eq!(h.contains("[numthreads(64, 1, 1)]"), pad == PadWaves::Always, "{dims:?} split={split}");
+        assert_eq!(h.contains("xcl_s_barrier();"), waves > 1, "{dims:?} split={split} {pad:?}");
+    }
+}
+
+/// What a program sees of its group when the group is padded to whole waves is what it sees
+/// otherwise: thread ids (1-D, 2-D and 3-D groups), the group id, TG_SIZE, its lane and the
+/// launched lanes of its wave, LDS shared across the group around `s_barrier`, and memory –
+/// each console thread runs once (an atomic count per group) and no padding lane stores.
+/// Wave64 programs (split on 32-lane GPUs: the barrier and the counter-paired forms) and
+/// wave32 ones, three groups each.
+#[test]
+fn gpu_padded_compute_groups_look_the_same_to_the_program() {
+    if !gpu_ready() {
+        return;
+    }
+    let w64 = [[40u32, 1, 1], [20, 1, 1], [10, 1, 1], [96, 1, 1], [8, 5, 1], [4, 5, 2], [4, 4, 6], [3, 1, 1], [1, 1, 1]];
+    let w32 = [[20u32, 1, 1], [10, 1, 1], [52, 1, 1], [5, 4, 1], [1, 1, 1]];
+    for (wave64, dims) in w64.map(|d| (true, d)).into_iter().chain(w32.map(|d| (false, d))) {
+        let lanes: u32 = if wave64 { 64 } else { 32 };
+        let (x, xy, n) = (dims[0], dims[0] * dims[1], dims.iter().product::<u32>());
+        let mut parts = vec![
+            // v21 = thread index in the group
+            ins("V_MAD_U32_U24", "ENC_VOP3", &[("VDST", 20), ("SRC0", V + 1), ("SRC1", 1), ("SRC2", V)], None),
+            ins("V_MAD_U32_U24", "ENC_VOP3", &[("VDST", 21), ("SRC0", V + 2), ("SRC1", 2), ("SRC2", V + 20)], None),
+            // LDS[4 · thread] = thread + 100; after the barrier, the word of thread n - 1 - thread
+            ins("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 22), ("SRC0", 130), ("VSRC1", 21)], None),
+            ins("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 23), ("SRC0", 255), ("VSRC1", 21)], Some(100)),
+            ins("DS_WRITE_B32", "ENC_DS", &[("ADDR", 22), ("DATA0", 23)], None),
+            ins("S_BARRIER", "ENC_SOPP", &[], None),
+            ins("V_SUB_NC_U32", "ENC_VOP2", &[("VDST", 32), ("SRC0", 3), ("VSRC1", 21)], None),
+            ins("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 32), ("SRC0", 193), ("VSRC1", 32)], None),
+            ins("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 32), ("SRC0", 130), ("VSRC1", 32)], None),
+            ins("DS_READ_B32", "ENC_DS", &[("VDST", 29), ("ADDR", 32)], None),
+            // count[group] += 1 at s0 - 64 + 4 · group
+            ins("S_SUB_U32", "ENC_SOP2", &[("SDST", 8), ("SSRC0", 0), ("SSRC1", 192)], None),
+            ins("S_MOV_B32", "ENC_SOP1", &[("SDST", 9), ("SSRC0", 128)], None),
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 40), ("SRC0", 4)], None),
+            ins("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 40), ("SRC0", 130), ("VSRC1", 40)], None),
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 41), ("SRC0", 129)], None),
+            ins("GLOBAL_ATOMIC_ADD", "ENC_FLAT_GLBL", &[("VDST", 42), ("ADDR", 40), ("DATA", 41), ("SADDR", 8), ("OFFSET", 0), ("GLC", 1)], None),
+            // the thread id, TG_SIZE (s5), the group id (s4), the lane and the wave's lanes
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 24), ("SRC0", V)], None),
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 25), ("SRC0", V + 1)], None),
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 26), ("SRC0", V + 2)], None),
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 27), ("SRC0", 5)], None),
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 28), ("SRC0", 4)], None),
+            ins("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 30), ("SRC0", 126), ("SRC1", 128)], None),
+        ];
+        if wave64 {
+            parts.push(ins("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 30), ("SRC0", 127), ("SRC1", V + 30)], None));
+            parts.push(ins("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 126)], None));
+        } else {
+            parts.push(ins("S_BCNT1_I32_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 126)], None));
+        }
+        parts.extend([
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 31), ("SRC0", 10)], None),
+            // out[(group · 256 + thread) · 32]: v24..v27, v28..v31
+            ins("S_LSHL_B32", "ENC_SOP2", &[("SDST", 11), ("SSRC0", 4), ("SSRC1", 136)], None),
+            ins("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 34), ("SRC0", 11), ("VSRC1", 21)], None),
+            ins("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 34), ("SRC0", 133), ("VSRC1", 34)], None),
+            ins("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 34), ("SRC0", 0), ("VSRC1", 34)], None),
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 35), ("SRC0", 128)], None),
+            ins("GLOBAL_STORE_DWORDX4", "ENC_FLAT_GLBL", &[("ADDR", 34), ("DATA", 24), ("SADDR", 0x7D)], None),
+            ins("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 34), ("SRC0", 144), ("VSRC1", 34)], None),
+            ins("GLOBAL_STORE_DWORDX4", "ENC_FLAT_GLBL", &[("ADDR", 34), ("DATA", 28), ("SADDR", 0x7D)], None),
+        ]);
+        let code = program_of(&parts);
+        let (base, groups) = (0x100usize, 3usize);
+        let mut tg_size = Vec::new();
+        for pad in [PadWaves::Never, PadWaves::Always, PadWaves::WhereSeen] {
+            let what = format!("{dims:?}, wave{lanes}, {pad:?}");
+            let t = translate(&code, &on_gpu(Options { mode: Mode::Compute(cs_of(dims, true)), wave64, pad_waves: pad, ..Default::default() })).unwrap();
+            assert!(t.complete(), "{what}: {:?}", t.unsupported_why);
+            let padded = t.hlsl.contains(&format!("[numthreads({}, 1, 1)]", n.next_multiple_of(lanes)));
+            // nothing here turns on a lane the wave did not launch: only `Always` pads
+            // (`XCL_CS_PAD_ALL` makes `WhereSeen` that)
+            assert_eq!(padded, pad == PadWaves::Always || pad == PadWaves::WhereSeen && std::env::var_os("XCL_CS_PAD_ALL").is_some(), "{what}");
+            let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let mut mem = vec![0xDEAD_BEEFu32; (base + groups * 256 * 32) / 4];
+            mem[..base / 4].fill(0);
+            let out = runner::dispatch(&dxil, [groups as u32, 1, 1], &[base as u32, x, xy, n], &mem).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let mut tg = Vec::new();
+            for g in 0..groups {
+                assert_eq!(out[(base - 64) / 4 + g], n, "{what}: threads of group {g} that ran");
+                for tid in 0..256u32 {
+                    let at = (base + (g * 256 + tid as usize) * 32) / 4;
+                    let got = &out[at..at + 8];
+                    if tid >= n {
+                        assert!(got.iter().all(|&v| v == 0xDEAD_BEEF), "{what}: group {g}, a thread {tid} stored");
+                        continue;
+                    }
+                    let (wave, lane) = (tid / lanes, tid % lanes);
+                    assert_eq!(&got[..3], &[tid % x, tid / x % dims[1], tid / xy], "{what}: group {g} thread {tid}: thread id");
+                    assert_eq!(got[3] >> 6, wave, "{what}: group {g} thread {tid}: wave in TG_SIZE");
+                    assert_eq!(got[4], g as u32, "{what}: thread {tid}: group id");
+                    assert_eq!(got[5], n - 1 - tid + 100, "{what}: group {g} thread {tid}: LDS word of thread {}", n - 1 - tid);
+                    assert_eq!(got[6], lane, "{what}: group {g} thread {tid}: lane");
+                    assert_eq!(got[7], (n - wave * lanes).min(lanes), "{what}: group {g} thread {tid}: lanes of its wave");
+                    tg.push(got[3]);
+                }
+            }
+            tg_size.push(tg);
+        }
+        assert!(tg_size[0] == tg_size[1] && tg_size[0] == tg_size[2], "{dims:?}, wave{lanes}: TG_SIZE with and without padding");
+    }
 }

@@ -484,7 +484,7 @@ fn evaluate(d: &Decoded, st: &State, vdst: u64) -> Option<[Hi; 32]> {
 }
 
 /// SGPRs an instruction may write (first register, count), from its output operands.
-fn sgpr_outputs(d: &Decoded) -> Vec<(u64, u64)> {
+pub(super) fn sgpr_outputs(d: &Decoded) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
     for o in d.ienc.operands.iter().filter(|o| o.output) {
         let n = (o.size as u64).div_ceil(32).max(1);
@@ -494,7 +494,8 @@ fn sgpr_outputs(d: &Decoded) -> Vec<(u64, u64)> {
             (_, "OPR_SDST_M0") => out.push((124, 1)),
             (Some(f), ty) if !ty.starts_with("OPR_VGPR") && ty != "OPR_SRC_VGPR" => {
                 let v = rdna2::field_value(d.enc, &d.words, f).unwrap_or(0) * rdna2::register_scale(f);
-                if v < 128 {
+                // 125: NULL, written by nothing
+                if v < 128 && v != 125 {
                     out.push((v, n));
                 }
             }
@@ -506,13 +507,17 @@ fn sgpr_outputs(d: &Decoded) -> Vec<(u64, u64)> {
         if let Some(e) = ext_encoding(d) {
             let x = |n: &str| rdna2::field_value(e, &d.words, n).unwrap_or(0);
             out.retain(|&(r, _)| r != 106);
-            out.push(if x("SD") == 1 { (x("SDST"), 2) } else { (106, 2) });
+            match x("SD") {
+                1 if x("SDST") == 125 => {}
+                1 => out.push((x("SDST"), 2)),
+                _ => out.push((106, 2)),
+            }
         }
     }
     out
 }
 
-fn is_valu(d: &Decoded) -> bool {
+pub(super) fn is_valu(d: &Decoded) -> bool {
     d.enc.name.starts_with("ENC_VOP") || d.enc.name.starts_with("VOP")
 }
 
@@ -713,7 +718,7 @@ fn classify(d: &Decoded, st: &State) -> Option<(Read, Option<(u64, u32)>)> {
 }
 
 /// Successors of each instruction (index); None: unknown (an indirect jump).
-fn successors(insts: &[Decoded], pcs: &BTreeMap<u64, usize>) -> Vec<Option<Vec<usize>>> {
+pub(super) fn successors(insts: &[Decoded], pcs: &BTreeMap<u64, usize>) -> Vec<Option<Vec<usize>>> {
     insts
         .iter()
         .enumerate()
