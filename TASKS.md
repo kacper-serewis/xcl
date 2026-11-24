@@ -13,8 +13,10 @@ Base `9e3831e1f570d3646e53ab753b19ec07eb8f1485`. The supplied 1.0.2.1 pack trans
 - [x] Align the memory-query test buffer. PR #656 at `d3e0b22`, integration `519c7c5`, `hle/kernelx.rs`. The focused test `xmem_virtual_query_marks_cpu_readable_memory` went from one failure to one pass. Full workspace 776 passed, 0 failed, 41 ignored, including three explicit skips.
 
 - [ ] Validate compute-list predication resource state. PR #1017, hle/d3d12x/list_x.rs. Run cargo test -p xcl predication and verify the compute-list state. EXCLUDED. WARP accepted the base state 0x200 and rejected the proposed 0x40 with D3D12 debug error 538. The compute-list assertion also reported actual 64, expected 512.
-- [ ] Validate packed dot-product accumulator modifiers. PR #1286, gpu/recomp/{emit,tests}.rs. Run cargo test -p xcl --lib gpu_dot2_f32_f16_abs_neg_on_src2. Two failures on base and two passes on e89af0c, with GPU execution. Gemini review pending.
+- [ ] Validate packed dot-product accumulator modifiers. PR #1286, gpu/recomp/{emit,tests}.rs. Run cargo test -p xcl --lib gpu_dot2_f32_f16_abs_neg_on_src2. Two failures on base and two passes on e89af0c, with GPU execution. Gemini approved and the change was applied locally at d6dea29.
 - [ ] Share identical shader bytes between pipelines. PR #827, hle/d3d12x/real.rs. Run cargo test -p xcl --lib pipelines_with_the_same_shader_share_one_copy_of_its_bytes and verify distinct content remains distinct.
 
-- [ ] Validate sparse release lock contention (#1478), hle/d3d12x/sparse.rs. Run cargo test -p xcl --lib a_released_buffer_is_forgotten_while_the_state_is_locked.
+- [ ] Validate sparse release lock contention (#1478), hle/d3d12x/sparse.rs. Run cargo test -p xcl --lib a_released_buffer_is_forgotten_while_the_state_is_locked. Parent timed out after 5 s; b3fb51c passed both contention and tile bookkeeping checks. Review pending.
 - [ ] Validate vertex layer and viewport exports (#1350), gpu/recomp/{emit,tests}.rs. Run cargo test -p xcl --lib vs_layer_and_viewport_index_from_the_misc_vector and check per-slice readback.
+
+- [ ] Preserve pixel shader helper lanes (#134), gpu/recomp. Run cargo test -p xcl --lib -- ps_masks helper_lanes wave64_ps. RTX 5070 triangle-edge errors fell from 384/1024 to 0/1024 at c66483b. Review pending on AMD compatibility.
