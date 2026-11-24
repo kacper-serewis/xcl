@@ -17,6 +17,6 @@ Base `9e3831e1f570d3646e53ab753b19ec07eb8f1485`. The supplied 1.0.2.1 pack trans
 - [ ] Share identical shader bytes between pipelines. PR #827, hle/d3d12x/real.rs. Run cargo test -p xcl --lib pipelines_with_the_same_shader_share_one_copy_of_its_bytes and verify distinct content remains distinct.
 
 - [ ] Validate sparse release lock contention (#1478), hle/d3d12x/sparse.rs. Run cargo test -p xcl --lib a_released_buffer_is_forgotten_while_the_state_is_locked. Parent timed out after 5 s; b3fb51c passed both contention and tile bookkeeping checks. Review pending.
-- [ ] Validate vertex layer and viewport exports (#1350), gpu/recomp/{emit,tests}.rs. Run cargo test -p xcl --lib vs_layer_and_viewport_index_from_the_misc_vector and check per-slice readback.
+- [ ] Validate vertex layer and viewport exports (#1350), gpu/recomp/{emit,tests}.rs. Run cargo test -p xcl --lib vs_layer_and_viewport_index_from_the_misc_vector and check per-slice readback. Parent 1 passed, 1 failed; head 216c317 passed both. Each of four draws on the RTX 5070 colored exactly 128 selected pixels and left 384 clear. Feature-negative path under review.
 
 - [ ] Preserve pixel shader helper lanes (#134), gpu/recomp. Run cargo test -p xcl --lib -- ps_masks helper_lanes wave64_ps. RTX 5070 triangle-edge errors fell from 384/1024 to 0/1024 at c66483b. Review pending on AMD compatibility.
