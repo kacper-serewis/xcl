@@ -797,6 +797,59 @@ fn new_decoder(stream: u32, channels: u32) -> Option<opus::Decoder> {
     }
 }
 
+/// Convert interleaved `i16` PCM samples to `[-1.0, 1.0)` `f32` (`v as f32 / 32768.0`)
+/// and return the number of non-zero input samples.
+#[inline]
+fn convert_i16_to_f32_scalar(src: &[i16], dst: &mut [f32]) -> u64 {
+    let mut nonzero = 0u64;
+    for (o, &v) in dst.iter_mut().zip(src.iter()) {
+        *o = v as f32 * (1.0 / 32768.0);
+        nonzero += (v != 0) as u64;
+    }
+    nonzero
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn convert_i16_to_f32_avx2(src: &[i16], dst: &mut [f32]) -> u64 {
+    use std::arch::x86_64::*;
+    let len = src.len().min(dst.len());
+    let mut i = 0usize;
+    let scale = _mm256_set1_ps(1.0 / 32768.0);
+    let zero = _mm256_setzero_si256();
+    let mut zero_acc = _mm256_setzero_si256();
+    let sp = src.as_ptr();
+    let dp = dst.as_mut_ptr();
+    while i + 8 <= len {
+        let v16 = _mm_loadu_si128(sp.add(i) as *const __m128i);
+        let v32 = _mm256_cvtepi16_epi32(v16);
+        let vf = _mm256_mul_ps(_mm256_cvtepi32_ps(v32), scale);
+        _mm256_storeu_ps(dp.add(i), vf);
+        // cmpeq yields -1 for zero lanes, so subtracting accumulates +1 per zero lane.
+        zero_acc = _mm256_sub_epi32(zero_acc, _mm256_cmpeq_epi32(v32, zero));
+        i += 8;
+    }
+    let mut counts = [0u32; 8];
+    _mm256_storeu_si256(counts.as_mut_ptr() as *mut __m256i, zero_acc);
+    let zeros: u64 = counts.iter().map(|&c| c as u64).sum();
+    let mut nonzero = (i as u64) - zeros;
+    if i < len {
+        nonzero += convert_i16_to_f32_scalar(&src[i..len], &mut dst[i..len]);
+    }
+    nonzero
+}
+
+fn convert_i16_to_f32(src: &[i16], dst: &mut [f32]) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static HAS_AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *HAS_AVX2.get_or_init(|| std::arch::is_x86_feature_detected!("avx2")) {
+            return unsafe { convert_i16_to_f32_avx2(src, dst) };
+        }
+    }
+    convert_i16_to_f32_scalar(src, dst)
+}
+
 /// Decodes a Process command's input (an Opus packet) into `out` (float32 samples, `channels` interleaved):
 /// `first_frame` frames of what the decoder produces are skipped, the rest fills `out` (what is not
 /// produced stays silent). Returns the frames written (None: nothing was decoded).
@@ -816,11 +869,7 @@ unsafe fn decode_into(s: &mut XApuStream, stream: u32, p: &XApuProcess, out: &mu
         Ok(frames) if frames > 0 => {
             let skip = (first_frame as usize).min(frames);
             let produced = (frames - skip).min(out.len() / ch);
-            let mut nonzero = 0u64;
-            for (o, &v) in out.iter_mut().zip(pcm[skip * ch..(skip + produced) * ch].iter()) {
-                *o = v as f32 / 32768.0;
-                nonzero += (v != 0) as u64;
-            }
+            let nonzero = convert_i16_to_f32(&pcm[skip * ch..(skip + produced) * ch], out);
             xaudio2::note_console_decode(1, 0, produced as u64, nonzero);
             Some(produced)
         }
@@ -1292,5 +1341,59 @@ mod tests {
             assert_ne!(VirtualQuery(allocated_ptr as *const c_void, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()), 0);
             assert_eq!(mbi.State, MEM_FREE, "data buffer must be released when event creation fails");
         }
+    }
+
+    #[test]
+    fn convert_i16_to_f32_avx2_matches_scalar_bit_for_bit() {
+        // Exhaustive check across all 65,536 i16 values (including 0, i16::MIN, i16::MAX).
+        let all: Vec<i16> = (i16::MIN..=i16::MAX).collect();
+        let mut scalar_out = vec![0.0f32; all.len()];
+        let mut dispatch_out = vec![0.0f32; all.len()];
+        let scalar_nz = convert_i16_to_f32_scalar(&all, &mut scalar_out);
+        let dispatch_nz = convert_i16_to_f32(&all, &mut dispatch_out);
+        assert_eq!(scalar_nz, 65_535);
+        assert_eq!(dispatch_nz, scalar_nz);
+        for (i, (&s, &d)) in scalar_out.iter().zip(dispatch_out.iter()).enumerate() {
+            assert_eq!(s.to_bits(), (all[i] as f32 / 32768.0).to_bits(), "div parity at {i}");
+            assert_eq!(d.to_bits(), s.to_bits(), "dispatch parity at {i}");
+        }
+        // Tail lengths (0..=17) and mismatched slice lengths (dst shorter than src).
+        for len in 0..=17usize {
+            let src: Vec<i16> = (0..len)
+                .map(|i| if i % 3 == 0 { 0 } else { (i as i16).wrapping_mul(3211).wrapping_sub(15000) })
+                .collect();
+            let mut s_out = vec![f32::NAN; len];
+            let mut d_out = vec![f32::NAN; len];
+            let s_nz = convert_i16_to_f32_scalar(&src, &mut s_out);
+            let d_nz = convert_i16_to_f32(&src, &mut d_out);
+            assert_eq!(d_nz, s_nz, "nonzero mismatch for len={len}");
+            assert_eq!(
+                d_out.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                s_out.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                "sample mismatch for len={len}"
+            );
+            #[cfg(target_arch = "x86_64")]
+            if std::arch::is_x86_feature_detected!("avx2") {
+                let mut a_out = vec![f32::NAN; len];
+                let a_nz = unsafe { convert_i16_to_f32_avx2(&src, &mut a_out) };
+                assert_eq!(a_nz, s_nz, "avx2 nonzero mismatch for len={len}");
+                assert_eq!(
+                    a_out.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    s_out.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    "avx2 sample mismatch for len={len}"
+                );
+            }
+        }
+        let short_src = [100i16, 0, -32768, 32767, 1, 2, 3, 4, 5, 6];
+        let mut short_s = [0.0f32; 5];
+        let mut short_d = [0.0f32; 5];
+        assert_eq!(
+            convert_i16_to_f32(&short_src, &mut short_d),
+            convert_i16_to_f32_scalar(&short_src, &mut short_s)
+        );
+        assert_eq!(
+            short_d.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            short_s.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+        );
     }
 }
