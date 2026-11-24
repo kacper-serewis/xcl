@@ -4062,6 +4062,15 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
     pc::<W>(this, PC_WRITE_BUFFER_IMMEDIATE)(this, params.len() as u32, params.as_ptr(), modes.as_ptr());
 }
 
+/// command list #31 SetPredication(buffer, offset, operation) (PC #55): buffers placed below
+/// their console address add `buffer_delta(buffer)` to the offset, as ResolveQueryData does, so
+/// the predicate is read where the resolve wrote it.
+pub(super) unsafe extern "system" fn set_predication_x(this: *mut c_void, res: usize, offset: u64, op: D3D12_PREDICATION_OP) {
+    let pc_offset = offset.saturating_add(real::buffer_delta(res));
+    type F = unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP);
+    pc::<F>(this, PC_SET_PREDICATION)(this, res, pc_offset, op);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5265,6 +5274,43 @@ mod tests {
         on_release(list_key);
         assert!(!has_list_state(list_key));
         assert_eq!(fake_res.refs.load(Ordering::Relaxed), 0);
+    }
+
+    /// #31 SetPredication on a buffer placed below the title's address reads the predicate at the
+    /// offset #30 ResolveQueryData writes it to (both add `real::buffer_delta`); a null buffer
+    /// passes through.
+    #[test]
+    fn set_predication_x_adds_the_buffer_delta() {
+        #[repr(C)]
+        struct FakePredList {
+            vt: *const usize,
+            calls: Mutex<Vec<(usize, u64, i32)>>,
+        }
+
+        unsafe extern "system" fn fake_set_predication(this: *mut c_void, res: usize, off: u64, op: D3D12_PREDICATION_OP) {
+            (*(this as *const FakePredList)).calls.lock().unwrap().push((res, off, op.0));
+        }
+
+        let mut orig_vt = [0usize; 64];
+        orig_vt[PC_SET_PREDICATION] = fake_set_predication as usize;
+        let ext_vt = [orig_vt.as_ptr() as usize, 0];
+        let fake = Box::new(FakePredList {
+            // SAFETY: `ext_vt` has 2 entries so `.add(1)` has `orig_vt` at `-1` as `real::orig_fn` expects.
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            calls: Mutex::new(Vec::new()),
+        });
+        let list_ptr = &*fake as *const FakePredList as *mut c_void;
+        let res = 0x31_5000usize;
+
+        real::set_test_buffer_delta(res, Some(0x200));
+        unsafe {
+            set_predication_x(list_ptr, res, 0x10, D3D12_PREDICATION_OP_EQUAL_ZERO);
+            set_predication_x(list_ptr, 0, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+        }
+        real::set_test_buffer_delta(res, None);
+
+        assert_eq!(*fake.calls.lock().unwrap(), vec![(res, 0x210, 0), (0, 0, 0)]);
+        on_release(list_ptr as usize);
     }
 
     /// Write64BitValueBottomOfPipeX / Write64BitValueTopOfPipeX with timestamp flags targeting

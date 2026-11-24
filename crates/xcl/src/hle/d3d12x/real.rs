@@ -1009,6 +1009,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (28, l::begin_query_x as usize),
                 (29, l::end_query_x as usize),
                 (30, l::resolve_query_data_x as usize),
+                (31, l::set_predication_x as usize),
                 (47, l::ia_set_index_buffer_x as usize),
                 (60, l::copy_memory_x as usize),
                 (61, l::fill32_x as usize),
@@ -7010,5 +7011,19 @@ mod map_tests {
                 m.remove(&(upload.as_raw() as usize));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod set_predication_slot_tests {
+    use super::*;
+
+    /// A title's #31 is SetPredication (PC #55) through `list_x::set_predication_x`, which adds
+    /// the buffer delta as #30 ResolveQueryData does.
+    #[test]
+    fn title_slot_31_runs_set_predication_x() {
+        assert!(console_remap(Kind::CommandList).contains(&(31, 55)));
+        let own = console_slots(Kind::CommandList);
+        assert_eq!(own.iter().find(|e| e.0 == 31).map(|e| e.1), Some(super::super::list_x::set_predication_x as usize));
     }
 }
