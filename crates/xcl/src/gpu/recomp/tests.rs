@@ -2306,6 +2306,41 @@ fn gpu_cube_array_slices() {
     }
 }
 
+/// image_get_resinfo on a 1D array (DIM 4) gives the layers in y, as RDNA does (GFX9, which
+/// binds 1D arrays as 2D arrays, gives them in z and Mesa moves them to y there only).
+#[test]
+fn image_get_resinfo_1d_array_layers_in_y() {
+    let code = prog(&[("IMAGE_GET_RESINFO", "ENC_MIMG", &[("VDATA", 20), ("VADDR", 3), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 4)], None)]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.hlsl.contains("Texture1DArray<float4>"), "{}", t.hlsl);
+    let call = t.hlsl.split("_T.GetDimensions(").nth(1).and_then(|s| s.split(')').next()).unwrap_or_else(|| panic!("{}", t.hlsl));
+    let args: Vec<&str> = call.split(", ").collect();
+    assert!(args.len() == 4 && args[2].ends_with("_h"), "GetDimensions({call}) must write the elements into _h\n{}", t.hlsl);
+}
+
+/// A 4-wide 1D array of 3 layers: image_get_resinfo gives (width, layers, _, mips).
+#[test]
+fn gpu_image_get_resinfo_1d_array() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
+    let mut code = encode("IMAGE_GET_RESINFO", "ENC_MIMG", &[("VDATA", 20), ("VADDR", 3), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 4)], None).unwrap();
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 77, 12));
+    for r in st.vgpr.iter_mut() {
+        r[3] = 0; // mip
+    }
+    let tex = [TestTexture { dim: TexDim::D1Array, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 1, depth: 3, texel_bytes: 16, data: vec![0; 4 * 3 * 16], uav: false }];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
+    for l in 0..64 {
+        let v = &r.vgpr[l];
+        assert_eq!([v[20], v[21], v[23]], [4, 3, 1], "lane {l} resinfo (w, layers, mips)");
+    }
+}
+
 #[test]
 fn gpu_images_sample_load_store_atomic() {
     if !gpu_ready() {

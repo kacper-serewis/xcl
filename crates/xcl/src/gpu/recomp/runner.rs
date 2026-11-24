@@ -130,6 +130,7 @@ fn root_signature(dev: &ID3D12Device, graphics: bool) -> Result<ID3D12RootSignat
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TexDim {
+    D1Array,
     D2,
     D2Array,
     D3,
@@ -209,6 +210,7 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
     for t in textures {
         let (dim, depth_or_array) = match t.dim {
             TexDim::D3 => (D3D12_RESOURCE_DIMENSION_TEXTURE3D, t.depth),
+            TexDim::D1Array => (D3D12_RESOURCE_DIMENSION_TEXTURE1D, t.depth),
             _ => (D3D12_RESOURCE_DIMENSION_TEXTURE2D, t.depth),
         };
         let rd = D3D12_RESOURCE_DESC {
@@ -270,6 +272,12 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
         let mut sv = D3D12_SHADER_RESOURCE_VIEW_DESC { Format: t.format, Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, ..Default::default() };
         let mut uv = D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: t.format, ..Default::default() };
         match t.dim {
+            TexDim::D1Array => {
+                sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
+                sv.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_SRV { MipLevels: 1, ArraySize: t.depth, ..Default::default() };
+                uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
+                uv.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_UAV { ArraySize: t.depth, ..Default::default() };
+            }
             TexDim::D2 => {
                 sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
                 sv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() };

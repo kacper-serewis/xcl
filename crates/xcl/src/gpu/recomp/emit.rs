@@ -2413,7 +2413,8 @@ impl Em {
                 2 => ("Texture3D", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_d, {t}_n);")),
                 // the hardware returns the layers (6 per cube), as for a 2D array
                 3 => ("TextureCubeArray", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_d, {t}_n); {t}_d *= 6u;")),
-                4 => ("Texture1DArray", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_d, {t}_n); {t}_h = 1u;")),
+                // RDNA gives a 1D array's layers in y (only GFX9, which binds it as a 2D array, in z)
+                4 => ("Texture1DArray", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_n); {t}_d = {t}_h;")),
                 5 => ("Texture2DArray", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_d, {t}_n);")),
                 _ => return Err("get_resinfo dim"),
             };
