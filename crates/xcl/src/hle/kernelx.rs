@@ -2056,8 +2056,13 @@ mod tests {
 
     #[test]
     fn xmem_virtual_query_marks_cpu_readable_memory() {
+        // VirtualQueryEx writes a MEMORY_BASIC_INFORMATION at the start of the buffer.
+        #[repr(align(8))]
+        struct QueryBuffer([u8; 64]);
+
         unsafe {
-            let mut info = [0u8; 64];
+            let mut storage = QueryBuffer([0; 64]);
+            let info = &mut storage.0;
             let x = 5u32;
             let proc_ = thr::GetCurrentProcess();
             assert_eq!(XMemVirtualQuery(proc_, &x as *const u32 as _, info.as_mut_ptr() as _), 1);
@@ -2066,7 +2071,7 @@ mod tests {
             assert_eq!(u32::from_le_bytes(info[48..52].try_into().unwrap()) & 3, 1);
             // reserved, not committed: not CPU-readable
             let r = mem::VirtualAlloc(std::ptr::null(), 0x10000, mem::MEM_RESERVE, mem::PAGE_NOACCESS);
-            let mut info = [0u8; 64];
+            info.fill(0);
             assert_eq!(XMemVirtualQuery(proc_, r, info.as_mut_ptr() as _), 1);
             assert_eq!(info[48] & 3, 0);
             mem::VirtualFree(r, 0, mem::MEM_RELEASE);
