@@ -2792,11 +2792,12 @@ pub(super) unsafe fn before_close(list: *mut c_void) {
 /// Clear active predication state when `ID3D12GraphicsCommandList::Reset` resets a recording.
 pub(super) fn on_pc_reset(list: *mut c_void) {
     reset_copy_scratch(list);
-    if !PREDICATION_USED.load(Ordering::Acquire) || list.is_null() {
+    if list.is_null() {
         return;
     }
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
         s.predication = None;
+        s.bindings.predication = None;
         s.pred_in_state = false;
     }
 }
@@ -5382,6 +5383,9 @@ mod tests {
             set_predication_x(list_ptr, res, 0x10, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO);
             direct = restore(D3D12_COMMAND_LIST_TYPE_DIRECT);
             compute = restore(D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            on_pc_reset(list_ptr);
+            let saved = LISTS.lock().unwrap().as_ref().unwrap()[&(list_ptr as usize)].bindings.predication;
+            assert!(saved.is_none(), "native Reset starts a recording without the previous predicate");
             set_predication_x(list_ptr, 0, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
             null_restored = restore(D3D12_COMMAND_LIST_TYPE_DIRECT);
 
