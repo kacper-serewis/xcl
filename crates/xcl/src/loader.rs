@@ -533,6 +533,16 @@ mod tests {
         // the executable (never marked initialised) gets them
         unsafe { thread_event(&[module(false)], 2) };
         assert_eq!(CALLS.load(Ordering::Relaxed), 2 + 3 + 2);
+
+        // XCL currently skips attach during initialization. Detach can still arrive later
+        // on this thread, after the loading thread has published successful initialization.
+        let loading = module(true);
+        CALLS.store(0, Ordering::Relaxed);
+        unsafe { thread_event(std::slice::from_ref(&loading), 2) };
+        assert_eq!(CALLS.load(Ordering::Relaxed), 0);
+        loading.initialized.store(true, Ordering::Release);
+        unsafe { thread_event(std::slice::from_ref(&loading), 3) };
+        assert_eq!(CALLS.load(Ordering::Relaxed), 3);
     }
 
     /// DllMain returning FALSE: the load fails, the DLL is not left registered as loaded, and a
