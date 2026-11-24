@@ -405,6 +405,12 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 /// (a list's `Reset`, with `XCL_DRED=1` on every start): the two then waited for each other.
 static QUEUE: Mutex<Option<ID3D12CommandQueue>> = Mutex::new(None);
 
+/// Placed buffers whose last `Release` came while `STATE` was busy, forgotten by its next holder
+/// (`State::forget_pending`). A title's frame loop makes such a `Release` every frame, and a
+/// holder can be in a GPU wait (`readback_now`) or a tile mapping on a queue that does not move:
+/// the frame loop then stood still until the title's own stall check ended it (#505).
+static FORGET: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
 /// (bytes of video memory in pool heaps, of those mapped) – `XCL_ACTIVITY`
 pub fn pool_bytes() -> (usize, usize) {
     let g = STATE.lock().unwrap();
@@ -569,7 +575,8 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
         Ok(s) => {
             crate::xlog_info!("D3D12.X: {} sparse window(s) for the title's own memory (tiled buffers on video memory)", out.len());
             // a state this replaces (the windows set up again) goes after the lock: the release of
-            // its last buffers reaches `forget_buffer`, which takes the lock (#344)
+            // its last buffers reaches `forget_buffer`, which tries the lock (#344); what it queues
+            // for buffers of the old state is ignored by the new one
             // (the queue first: `queue()` never answers with one older than the state's)
             let old_queue = QUEUE.lock().unwrap().replace(s.queue.clone());
             let old = STATE.lock().unwrap().replace(s);
@@ -595,6 +602,7 @@ impl State {
 
     unsafe fn take_tile(&mut self) -> Option<((u32, u32), bool)> {
         if self.free.is_empty() {
+            self.forget_pending();
             self.flush_parked();
         }
         if let Some(t) = self.free.pop() {
@@ -1391,6 +1399,29 @@ impl State {
         }
     }
 
+    /// The placed buffers released while the lock was busy (`forget_buffer`).
+    fn forget_pending(&mut self) {
+        let res = std::mem::take(&mut *FORGET.lock().unwrap());
+        self.forget_all(res);
+    }
+
+    /// Placed buffers gone: their tiles are not pinned by them any more (pointers of buffers this
+    /// state did not place are ignored).
+    fn forget_all(&mut self, res: impl IntoIterator<Item = usize>) {
+        for r in res {
+            let Some(tiles) = self.buffers.remove(&r) else { continue };
+            for tile in tiles {
+                if let Some(c) = self.pinned.get_mut(&tile) {
+                    *c -= 1;
+                    if *c == 0 {
+                        self.pinned.remove(&tile);
+                        self.release_if_unused(tile);
+                    }
+                }
+            }
+        }
+    }
+
     /// a pool tile no window maps, none is parked on and no buffer uses goes back to the free list
     fn release_if_unused(&mut self, tile: (u32, u32)) {
         if !self.pinned.contains_key(&tile) && !self.mapped.values().any(|e| e.pool == tile) && !self.parked.values().any(|&p| p == tile) {
@@ -1460,6 +1491,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let t0 = std::time::Instant::now();
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else { return };
+    s.forget_pending();
     // the title's work sees what was decommitted unmapped, as it was
     if s.flush_parked() {
         s.retire_free_pools();
@@ -1548,6 +1580,9 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
 pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, state: u32, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void) -> Option<(crate::util::HRESULT, usize)> {
     let mut g = STATE.lock().unwrap();
     let s = g.as_mut()?;
+    // (`buffers` is keyed by the resource's address: a release already queued for an earlier
+    // buffer at the same address must not unpin this one, so the queue is emptied before and below)
+    s.forget_pending();
     let start = va & !(TILE - 1);
     let delta = va - start;
     let bytes = desc.Width as usize;
@@ -1579,24 +1614,22 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     for &(_, tile) in &tiles {
         *s.pinned.entry(tile).or_default() += 1;
     }
+    s.forget_pending();
     s.buffers.insert(raw as usize, tiles.iter().map(|x| x.1).collect());
     s.signal();
     Some((hr, delta))
 }
 
-/// A placed buffer is gone: its tiles are not pinned by it any more.
+/// A placed buffer is gone: its tiles are not pinned by it any more. It does not wait for the
+/// state's lock: while another thread holds it, the buffer is forgotten by the lock's next holder
+/// (its tiles stay pinned until then, which only keeps them from being reused).
 pub fn forget_buffer(res: usize) {
-    let mut g = STATE.lock().unwrap();
-    let Some(s) = g.as_mut() else { return };
-    let Some(tiles) = s.buffers.remove(&res) else { return };
-    for tile in tiles {
-        if let Some(c) = s.pinned.get_mut(&tile) {
-            *c -= 1;
-            if *c == 0 {
-                s.pinned.remove(&tile);
-                s.release_if_unused(tile);
-            }
-        }
+    FORGET.lock().unwrap().push(res);
+    let Ok(mut g) = STATE.try_lock() else { return };
+    match g.as_mut() {
+        Some(s) => s.forget_pending(),
+        // no sparse windows: no buffer was placed (every resource's `Release` comes here)
+        None => FORGET.lock().unwrap().clear(),
     }
 }
 
@@ -1619,6 +1652,108 @@ mod tests {
         drop(held);
         asked.join().unwrap();
         assert!(answered, "queue() waited for the sparse state's lock");
+    }
+
+    /// A resource's last `Release` (`res_release`) does not wait while another thread holds the
+    /// state's lock: a title's frame loop releases resources every frame, and the holder can be
+    /// in a GPU wait (`readback_now`) or a tile mapping on a queue that does not move (#505).
+    #[test]
+    fn a_released_buffer_is_forgotten_while_the_state_is_locked() {
+        let held = STATE.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let released = std::thread::spawn(move || {
+            forget_buffer(0x5eed_0000);
+            let _ = tx.send(());
+        });
+        let answered = rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+        drop(held);
+        released.join().unwrap();
+        assert!(answered, "a resource's last Release waited for the sparse state's lock");
+    }
+
+    /// A forgotten buffer gives back the pool tiles no one else uses: a tile another buffer
+    /// still pins or a window still maps stays where it is; a buffer it did not place is ignored.
+    #[test]
+    fn a_forgotten_buffer_gives_back_only_its_unused_tiles() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.expect("D3D12 device");
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_fence");
+            let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).expect("event");
+            let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("rb_alloc");
+            let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).expect("rb_list");
+            rb_list.Close().expect("rb_list close");
+            let mut s = State {
+                dev,
+                queue,
+                fence,
+                value: 0,
+                event,
+                rb_fence,
+                rb_value: 0,
+                windows: Vec::new(),
+                pools: Vec::new(),
+                free: Vec::new(),
+                retired: Vec::new(),
+                parked: FxHashMap::default(),
+                mapped: FxHashMap::default(),
+                pinned: FxHashMap::default(),
+                buffers: FxHashMap::default(),
+                to_zero: Vec::new(),
+                staging: None,
+                ring_write: 0,
+                ring_submitted: 0,
+                ring_free: 0,
+                inflight: VecDeque::new(),
+                zero_buf: None,
+                slots: Vec::new(),
+                next_slot: 0,
+                readback: None,
+                rb_alloc,
+                rb_list,
+                rb_last_fence: 0,
+                waited: FxHashMap::default(),
+                runs: None,
+                scratch_runs: Vec::new(),
+            };
+
+            let (mapped_tile, shared, own) = ((0, 0), (0, 1), (0, 2));
+            let buffer = 0x7e57_0000usize;
+            s.buffers.insert(buffer, vec![mapped_tile, shared, own]);
+            s.pinned.insert(mapped_tile, 1);
+            s.pinned.insert(shared, 2);
+            s.pinned.insert(own, 1);
+            s.mapped.insert(0x10_0000, TileEntry::with_holes(mapped_tile, 0));
+
+            s.forget_all([buffer, 0xdead_0000]);
+            assert!(!s.buffers.contains_key(&buffer));
+            assert_eq!(s.pinned.get(&shared), Some(&1), "another buffer still pins it");
+            assert!(!s.pinned.contains_key(&mapped_tile) && !s.pinned.contains_key(&own));
+            assert_eq!(s.free, vec![own], "only the tile no one uses is free (a window maps the other)");
+
+            // a release while the lock is held is queued, and the lock's next holder forgets it
+            // (the lock is held here throughout, so no other holder drains the queue meanwhile)
+            let held = STATE.lock().unwrap();
+            let queued = 0x9e4d_0000usize;
+            s.buffers.insert(queued, vec![shared]);
+            std::thread::spawn(move || forget_buffer(queued)).join().unwrap();
+            assert!(s.buffers.contains_key(&queued), "forgotten before a holder of the lock took it");
+            s.forget_pending();
+            drop(held);
+            assert!(!s.buffers.contains_key(&queued));
+            assert!(!s.pinned.contains_key(&shared));
+            assert_eq!(s.free, vec![own, shared], "the queued release gave its tile back");
+        }
     }
 
     /// A block freed on one thread while another allocates: its address goes back to the
