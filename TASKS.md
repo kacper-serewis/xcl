@@ -21,10 +21,10 @@ Base `9e3831e1f570d3646e53ab753b19ec07eb8f1485`. The supplied 1.0.2.1 pack trans
 
 - [ ] Preserve pixel shader helper lanes (#134), gpu/recomp. Run cargo test -p xcl --lib -- ps_masks helper_lanes wave64_ps. RTX 5070 triangle-edge errors fell from 384/1024 to 0/1024 at c66483b. HOLD: current head has no AMD retest after earlier AMD pipeline creation crashes.
 
-- [ ] Validate first-run coherent memory sizing (#632), gpu/uma.rs. Run cargo test -p xcl --lib coherent_. Base 2 passed and 2 failed; contributor head 4 passed. At 6c4e263, only an automatic full-window launch claims the marker. Eight coherent tests passed. Independent re-review pending.
+- [ ] Validate first-run coherent memory sizing (#632), gpu/uma.rs. Run cargo test -p xcl --lib coherent_. Base 2 passed and 2 failed; contributor head 4 passed. At 6c4e263, only an automatic full-window launch claims the marker. Eight coherent tests passed. Gemini approved the corrected marker policy. Staged at a5e8534.
 
 - [ ] Hold #517 and companion #953 before integration. gpu/recomp/partition.rs classifies relative register moves as Exact despite divergent reference outputs (4,969/5,000 cuts on two vector cases). Neither classifier has a runtime caller. Test relative moves against the independent split-wave reference before relying on Exact.
-- [ ] Hold layout-table caching (#1048), gpu/tiling.rs. The same allocation assertion over 100 warmed layouts failed with 600 allocations on base and passed with zero at b7f375a. Validate the selected row before acquiring the cache lock and key on that row. Normal retail pipe constants were unaffected in review.
+- [ ] Hold layout-table caching (#1048), gpu/tiling.rs. The same allocation assertion over 100 warmed layouts failed with 600 allocations on base and passed with zero at b7f375a. Validate the selected row before acquiring the cache lock and key on that row. At b7b905a, two valid pipe configurations selecting one row now reuse the same tables. The new assertion failed before the fix and all 15 tiling tests passed after it. Claude approved. Staged at ad9243c.
 
 - [ ] Refuse unsupported GDS memory operations (#1238), gpu/recomp/emit.rs. Run cargo test -p xcl --lib ds_gds_plain. At 42ab602 the sweep went from 552 false successes to zero with 984 unchanged LDS outputs. Codex approved.
 
@@ -108,3 +108,7 @@ Batch 6013fca passed the workspace release build. The full suite reported 782 pa
 | [1291](https://github.com/xcl-dev/xcl/pull/1291) D3D12.X: console UAV clears (#53 / #54) get the slots' PC descriptors <br>`0fd1b66b77390ac9c1725fe00d5417b410e0a839` | `clear_uav_with_console_handles_clears_the_slots_view` | `x/src/hle/d3d12x/list_x.rs`, `x/src/hle/d3d12x/real.rs` | Hold. WARP readback passes, but inline-copied shared-heap UAVs can lack a published GPU descriptor. |
 | [1345](https://github.com/xcl-dev/xcl/pull/1345) Recompiler: one skip variable for all forward jumps of structured code <br>`c92035532ae47cd61fbd0e2d461a1fc13826359a` | `crossing_forward_jumps_guard_in_linear_size` | `x/src/gpu/recomp/mod.rs`, `x/src/gpu/recomp/tests.rs` | Hold. Linear-size test passes, RX 7700 XT replay hangs at pipeline 415, record 22571. |
 | [1017](https://github.com/xcl-dev/xcl/pull/1017) D3D12.X: use NON_PIXEL_SHADER_RESOURCE state for predication on compute command lists <br>`655064496b29aa560b4caa10ab73fa3f4b4baa5e` | `predication` | `x/src/hle/d3d12x/list_x.rs` | Exclude. WARP accepts base 0x200 and rejects proposed 0x40 (debug error 538). No positive red-to-green test established. |
+
+Batch 7960832 passed both workspace builds. Cargo reported 791 passed, 0 failed and 41 ignored, including two wave64 skips and one heap-window skip. Post-push fresh-profile smoke on the RTX 5070 showed 1,183 frames in 60 seconds, 15,114 MB peak commit and zero crashes or device removals.
+
+- [ ] Hold #1355, vfs_hooks.rs and tests/lazy_file_io.rs. The same four I/O tests failed on 7960832 with errors 998 and 1784 and passed on the contributor patch. Static review found that the scatter/gather hooks read the caller?s segment array before Windows validates it.
