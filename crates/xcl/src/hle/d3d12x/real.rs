@@ -4110,19 +4110,22 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
 /// The root signature pointer is kept as is (the translated paths replace it).
 #[allow(dead_code)] // the vectors only keep the copies alive
 enum OwnedDesc {
-    Compute(Box<D3D12_COMPUTE_PIPELINE_STATE_DESC>, Vec<Vec<u8>>),
-    Graphics(Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>, Vec<Vec<u8>>, Vec<D3D12_INPUT_ELEMENT_DESC>, Vec<std::ffi::CString>),
-    Stream(Box<[usize; 2]>, Vec<u8>, Vec<Vec<u8>>),
+    Compute(Box<D3D12_COMPUTE_PIPELINE_STATE_DESC>, Vec<std::sync::Arc<Box<[u8]>>>),
+    Graphics(Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>, Vec<std::sync::Arc<Box<[u8]>>>, Vec<D3D12_INPUT_ELEMENT_DESC>, Vec<std::ffi::CString>),
+    Stream(Box<[usize; 2]>, Vec<u8>, Vec<std::sync::Arc<Box<[u8]>>>),
 }
 
 unsafe impl Send for OwnedDesc {}
 
 /// A hash of a pipeline's shaders in their order (never 0): what `pso_async` knows a used
 /// pipeline by in the next run.
-fn shaders_key(blobs: &[Vec<u8>]) -> u64 {
+fn shaders_key<B: std::ops::Deref>(blobs: &[B]) -> u64
+where
+    B::Target: AsRef<[u8]>,
+{
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for b in blobs {
-        h = (h ^ crate::gpu::shader::fnv64(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        h = (h ^ crate::gpu::shader::fnv64((&**b).as_ref())).wrapping_mul(0x0000_0100_0000_01b3);
     }
     h | 1
 }
@@ -4137,7 +4140,168 @@ mod shaders_key_tests {
         assert_ne!(key, super::shaders_key(&[b.clone(), a.clone()]));
         assert_ne!(key, super::shaders_key(&[a.clone()]));
         assert_ne!(key, super::shaders_key(&[a, vec![4u8, 6]]));
-        assert_ne!(super::shaders_key(&[]), 0);
+        assert_ne!(super::shaders_key::<Vec<u8>>(&[]), 0);
+    }
+
+    #[test]
+    fn pipelines_with_the_same_shader_share_one_copy_of_its_bytes() {
+        let a = super::intern_shader_blob(&[7u8, 1, 2, 3, 0x5a]);
+        let b = super::intern_shader_blob(&[7u8, 1, 2, 3, 0x5a]);
+        assert!(std::sync::Arc::ptr_eq(&a, &b));
+        let c = super::intern_shader_blob(&[7u8, 1, 2, 3, 0x5b]);
+        assert!(!std::sync::Arc::ptr_eq(&a, &c));
+        assert_eq!(&**c, &[7u8, 1, 2, 3, 0x5b]);
+        assert_eq!(super::shaders_key(&[a.clone()]), super::shaders_key(&[vec![7u8, 1, 2, 3, 0x5a]]));
+        let weak = std::sync::Arc::downgrade(&a);
+        drop((a, b));
+        assert!(weak.upgrade().is_none(), "last strong owner drops the shader payload");
+        let d = super::intern_shader_blob(&[7u8, 1, 2, 3, 0x5a]);
+        assert_eq!(&**d, &[7u8, 1, 2, 3, 0x5a], "a copy every pipeline released is made again");
+        for i in 0u32..300 {
+            let mut b = [0u8; 8];
+            b[0..4].copy_from_slice(&0x5348_5244u32.to_le_bytes());
+            b[4..8].copy_from_slice(&i.to_le_bytes());
+            drop(super::intern_shader_blob(&b));
+        }
+        let e = super::intern_shader_blob(&[7u8, 1, 2, 3, 0x5a]);
+        assert!(std::sync::Arc::ptr_eq(&d, &e), "live entry survives expired-entry pruning");
+    }
+
+    #[test]
+    fn owned_descs_share_equal_shader_bytes_and_keep_different_bytes_separate() {
+        use std::collections::HashSet;
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        let n = 32usize;
+        let cs_bytes: Vec<u8> = (0..4096).map(|i| ((i * 31 + 7) & 0xff) as u8).collect();
+        let mut cs_diff = cs_bytes.clone();
+        *cs_diff.last_mut().unwrap() ^= 0xff;
+        let vs_bytes: Vec<u8> = (0..4096).map(|i| ((i * 17 + 3) & 0xff) as u8).collect();
+        let ps_bytes: Vec<u8> = (0..2048).map(|i| ((i * 23 + 11) & 0xff) as u8).collect();
+        let mut ps_diff = ps_bytes.clone();
+        ps_diff[1234] ^= 0x5a;
+        let ms_bytes: Vec<u8> = (0..4096).map(|i| ((i * 29 + 5) & 0xff) as u8).collect();
+        let mut ms_diff = ms_bytes.clone();
+        ms_diff[0] ^= 0x01;
+
+        // Compute path: equal shader bytes from separate overwritten buffers share one allocation.
+        let mut cs_descs = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut src = cs_bytes.clone();
+            let mut d = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
+            d.CS = super::bytecode(&src);
+            let owned = unsafe { super::own_compute(&d as *const _ as *const std::ffi::c_void) }.unwrap();
+            src.fill(0);
+            drop(src);
+            cs_descs.push(owned);
+        }
+        let mut cs_diff_src = cs_diff.clone();
+        let mut d_diff = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
+        d_diff.CS = super::bytecode(&cs_diff_src);
+        let cs_owned_diff = unsafe { super::own_compute(&d_diff as *const _ as *const std::ffi::c_void) }.unwrap();
+        cs_diff_src.fill(0);
+        drop(cs_diff_src);
+
+        let mut cs_ptrs = HashSet::new();
+        for o in &cs_descs {
+            let d = unsafe { &*(o.ptr() as *const D3D12_COMPUTE_PIPELINE_STATE_DESC) };
+            assert_eq!(unsafe { super::shader_bytes(&d.CS) }.unwrap(), cs_bytes.as_slice());
+            assert_eq!(o.shaders_key(), cs_descs[0].shaders_key());
+            cs_ptrs.insert((d.CS.pShaderBytecode as usize, d.CS.BytecodeLength));
+        }
+        assert_eq!(cs_ptrs.len(), 1);
+        assert_eq!(cs_ptrs.iter().map(|(_, len)| *len).sum::<usize>(), cs_bytes.len());
+        let d_diff_ref = unsafe { &*(cs_owned_diff.ptr() as *const D3D12_COMPUTE_PIPELINE_STATE_DESC) };
+        assert_eq!(unsafe { super::shader_bytes(&d_diff_ref.CS) }.unwrap(), cs_diff.as_slice());
+        assert!(!cs_ptrs.contains(&(d_diff_ref.CS.pShaderBytecode as usize, d_diff_ref.CS.BytecodeLength)));
+        assert_ne!(cs_owned_diff.shaders_key(), cs_descs[0].shaders_key());
+        drop((cs_descs, cs_owned_diff));
+
+        // Graphics path: equal VS+PS share one copy each; a different PS stays separate while sharing VS.
+        let mut gfx_descs = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut vs_src = vs_bytes.clone();
+            let mut ps_src = ps_bytes.clone();
+            let mut d = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+            d.VS = super::bytecode(&vs_src);
+            d.PS = super::bytecode(&ps_src);
+            let owned = unsafe { super::own_graphics(&d as *const _ as *const std::ffi::c_void) }.unwrap();
+            vs_src.fill(0);
+            ps_src.fill(0);
+            drop((vs_src, ps_src));
+            gfx_descs.push(owned);
+        }
+        let mut d_gdiff = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+        d_gdiff.VS = super::bytecode(&vs_bytes);
+        d_gdiff.PS = super::bytecode(&ps_diff);
+        let gfx_owned_diff = unsafe { super::own_graphics(&d_gdiff as *const _ as *const std::ffi::c_void) }.unwrap();
+
+        let mut gfx_ptrs = HashSet::new();
+        for o in &gfx_descs {
+            let d = unsafe { &*(o.ptr() as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC) };
+            assert_eq!(unsafe { super::shader_bytes(&d.VS) }.unwrap(), vs_bytes.as_slice());
+            assert_eq!(unsafe { super::shader_bytes(&d.PS) }.unwrap(), ps_bytes.as_slice());
+            assert_eq!(o.shaders_key(), gfx_descs[0].shaders_key());
+            gfx_ptrs.insert((d.VS.pShaderBytecode as usize, d.VS.BytecodeLength));
+            gfx_ptrs.insert((d.PS.pShaderBytecode as usize, d.PS.BytecodeLength));
+        }
+        assert_eq!(gfx_ptrs.len(), 2);
+        assert_eq!(gfx_ptrs.iter().map(|(_, len)| *len).sum::<usize>(), vs_bytes.len() + ps_bytes.len());
+        let gdiff_ref = unsafe { &*(gfx_owned_diff.ptr() as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC) };
+        assert_eq!(unsafe { super::shader_bytes(&gdiff_ref.VS) }.unwrap(), vs_bytes.as_slice());
+        assert_eq!(unsafe { super::shader_bytes(&gdiff_ref.PS) }.unwrap(), ps_diff.as_slice());
+        assert!(gfx_ptrs.contains(&(gdiff_ref.VS.pShaderBytecode as usize, gdiff_ref.VS.BytecodeLength)));
+        assert!(!gfx_ptrs.contains(&(gdiff_ref.PS.pShaderBytecode as usize, gdiff_ref.PS.BytecodeLength)));
+        assert_ne!(gfx_owned_diff.shaders_key(), gfx_descs[0].shaders_key());
+        drop((gfx_descs, gfx_owned_diff));
+
+        // Stream path: equal MS+PS share one copy each; a different MS stays separate while sharing PS.
+        let mut st_descs = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut ms_src = ms_bytes.clone();
+            let mut ps_src = ps_bytes.clone();
+            let mut s = super::StreamOut::default();
+            s.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &ms_src);
+            s.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &ps_src);
+            let desc: [usize; 2] = [s.0.len(), s.0.as_ptr() as usize];
+            let owned = unsafe { super::own_stream(desc.as_ptr() as *const std::ffi::c_void) }.unwrap();
+            ms_src.fill(0);
+            ps_src.fill(0);
+            drop((ms_src, ps_src));
+            st_descs.push(owned);
+        }
+        let mut s_diff = super::StreamOut::default();
+        s_diff.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &ms_diff);
+        s_diff.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &ps_bytes);
+        let desc_diff: [usize; 2] = [s_diff.0.len(), s_diff.0.as_ptr() as usize];
+        let st_owned_diff = unsafe { super::own_stream(desc_diff.as_ptr() as *const std::ffi::c_void) }.unwrap();
+
+        let mut st_ptrs = HashSet::new();
+        for o in &st_descs {
+            let pair = unsafe { &*(o.ptr() as *const [usize; 2]) };
+            let raw = unsafe { std::slice::from_raw_parts(pair[1] as *const u8, pair[0]) };
+            let subs = super::stream_subobjects(raw).unwrap();
+            let ms = subs.iter().find(|x| x.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).unwrap().1;
+            let ps = subs.iter().find(|x| x.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).unwrap().1;
+            assert_eq!(unsafe { super::payload_shader(ms) }.unwrap(), ms_bytes.as_slice());
+            assert_eq!(unsafe { super::payload_shader(ps) }.unwrap(), ps_bytes.as_slice());
+            assert_eq!(o.shaders_key(), st_descs[0].shaders_key());
+            st_ptrs.insert((u64::from_le_bytes(ms[0..8].try_into().unwrap()) as usize, u64::from_le_bytes(ms[8..16].try_into().unwrap()) as usize));
+            st_ptrs.insert((u64::from_le_bytes(ps[0..8].try_into().unwrap()) as usize, u64::from_le_bytes(ps[8..16].try_into().unwrap()) as usize));
+        }
+        assert_eq!(st_ptrs.len(), 2);
+        assert_eq!(st_ptrs.iter().map(|(_, len)| *len).sum::<usize>(), ms_bytes.len() + ps_bytes.len());
+        let pair_diff = unsafe { &*(st_owned_diff.ptr() as *const [usize; 2]) };
+        let raw_diff = unsafe { std::slice::from_raw_parts(pair_diff[1] as *const u8, pair_diff[0]) };
+        let subs_diff = super::stream_subobjects(raw_diff).unwrap();
+        let ms_d = subs_diff.iter().find(|x| x.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).unwrap().1;
+        let ps_d = subs_diff.iter().find(|x| x.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).unwrap().1;
+        assert_eq!(unsafe { super::payload_shader(ms_d) }.unwrap(), ms_diff.as_slice());
+        assert_eq!(unsafe { super::payload_shader(ps_d) }.unwrap(), ps_bytes.as_slice());
+        assert!(!st_ptrs.contains(&(u64::from_le_bytes(ms_d[0..8].try_into().unwrap()) as usize, u64::from_le_bytes(ms_d[8..16].try_into().unwrap()) as usize)));
+        assert!(st_ptrs.contains(&(u64::from_le_bytes(ps_d[0..8].try_into().unwrap()) as usize, u64::from_le_bytes(ps_d[8..16].try_into().unwrap()) as usize)));
+        assert_ne!(st_owned_diff.shaders_key(), st_descs[0].shaders_key());
+        drop((st_descs, st_owned_diff));
     }
 }
 
@@ -4159,10 +4323,30 @@ impl OwnedDesc {
     }
 }
 
-/// Copy a shader blob into `blobs` and point `b` at the copy.
-unsafe fn own_shader(b: &mut D3D12_SHADER_BYTECODE, blobs: &mut Vec<Vec<u8>>) {
+fn intern_shader_blob(bytes: &[u8]) -> std::sync::Arc<Box<[u8]>> {
+    // Arc<Box<[u8]>> (not Arc<[u8]>): a Weak<[u8]> keeps inline slice bytes allocated after the
+    // last strong owner drops, whereas Arc<Box<[u8]>> frees the byte buffer immediately.
+    static BLOBS: Mutex<Option<(HashMap<(u64, usize), std::sync::Weak<Box<[u8]>>>, usize)>> = Mutex::new(None);
+    let key = (crate::gpu::shader::fnv64(bytes), bytes.len());
+    let mut g = BLOBS.lock().unwrap();
+    let (m, next_prune) = g.get_or_insert_with(|| (HashMap::new(), 256));
+    if let Some(arc) = m.get(&key).and_then(|w| w.upgrade()) {
+        if &**arc == bytes {
+            return arc;
+        }
+    }
+    if m.len() >= *next_prune {
+        m.retain(|_, w| w.strong_count() > 0);
+        *next_prune = (m.len() * 2).max(256);
+    }
+    let arc: std::sync::Arc<Box<[u8]>> = std::sync::Arc::new(Box::from(bytes));
+    m.insert(key, std::sync::Arc::downgrade(&arc));
+    arc
+}
+
+unsafe fn own_shader(b: &mut D3D12_SHADER_BYTECODE, blobs: &mut Vec<std::sync::Arc<Box<[u8]>>>) {
     if let Some(bytes) = shader_bytes(b) {
-        blobs.push(bytes.to_vec());
+        blobs.push(intern_shader_blob(bytes));
         let v = blobs.last().unwrap();
         *b = bytecode(v);
     } else {
@@ -4211,7 +4395,7 @@ unsafe fn own_stream(desc: *const c_void) -> Option<OwnedDesc> {
         return None;
     }
     let mut buf = std::slice::from_raw_parts(base as *const u8, size).to_vec();
-    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    let mut blobs: Vec<std::sync::Arc<Box<[u8]>>> = Vec::new();
     let mut off = 0usize;
     while off + 8 <= size {
         let ty = u32::from_le_bytes(buf[off..off + 4].try_into().ok()?);
@@ -4222,8 +4406,9 @@ unsafe fn own_stream(desc: *const c_void) -> Option<OwnedDesc> {
             1..=6 | 24 | 25 => {
                 let (p, n) = (word(&buf, 0) as usize, word(&buf, 1) as usize);
                 if p != 0 && n != 0 && crate::gpu::shader::readable(p, n) {
-                    blobs.push(std::slice::from_raw_parts(p as *const u8, n).to_vec());
-                    buf[at..at + 8].copy_from_slice(&(blobs.last().unwrap().as_ptr() as u64).to_le_bytes());
+                    let slice = std::slice::from_raw_parts(p as *const u8, n);
+                    blobs.push(intern_shader_blob(slice));
+                    buf[at..at + 8].copy_from_slice(&((&**blobs.last().unwrap()).as_ptr() as u64).to_le_bytes());
                 }
             }
             7 | 12 | 22 if buf[at..at + psize].iter().any(|&b| b != 0) => return None,
