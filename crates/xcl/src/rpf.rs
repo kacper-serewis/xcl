@@ -60,6 +60,27 @@ impl Drop for TempPath {
     }
 }
 
+/// `path` as the NUL-terminated wide string `MoveFileExW` takes. That call fails with error 3 for a
+/// path of `MAX_PATH` characters or more unless it is verbatim (`\\?\`); std's own file calls add the
+/// prefix themselves, this one does not. A short, verbatim or device path is left as it is.
+fn move_path(path: &Path) -> io::Result<Vec<u16>> {
+    // std::path::absolute treats the NT prefix as a root-relative DOS path.
+    if path.as_os_str().as_encoded_bytes().starts_with(br"\??\") {
+        return Ok(path.as_os_str().encode_wide().chain(std::iter::once(0)).collect());
+    }
+    let mut wide: Vec<u16> = std::path::absolute(path)?.as_os_str().encode_wide().collect();
+    let utf16 = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+    if wide.len() >= 260 && !wide.starts_with(&utf16(r"\\?\")) && !wide.starts_with(&utf16(r"\\.\")) {
+        wide = if wide.starts_with(&utf16(r"\\")) {
+            [utf16(r"\\?\UNC\"), wide[2..].to_vec()].concat()
+        } else {
+            [utf16(r"\\?\"), wide].concat()
+        };
+    }
+    wide.push(0);
+    Ok(wide)
+}
+
 fn atomic_write_with(
     path: &Path,
     data: &[u8],
@@ -84,8 +105,8 @@ fn atomic_write_with(
         return Err(io::Error::new(io::ErrorKind::AlreadyExists, "output appeared during extraction"));
     }
     before_commit(&temporary.0)?;
-    let from: Vec<u16> = temporary.0.as_os_str().encode_wide().chain([0]).collect();
-    let to: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let from = move_path(&temporary.0)?;
+    let to = move_path(path)?;
     if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -289,6 +310,57 @@ mod tests {
         assert!(matches!(error.kind(), io::ErrorKind::AlreadyExists | io::ErrorKind::PermissionDenied));
         assert_eq!(std::fs::read(&output).unwrap(), b"appeared concurrently");
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn units(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain([0]).collect()
+    }
+
+    #[test]
+    fn move_path_prefixes_only_what_is_past_max_path() {
+        let nt = r"\??\C:\a\b.bin";
+        assert_eq!(move_path(Path::new(nt)).unwrap(), units(nt));
+        let long = format!(r"C:\{}\file.bin", "d".repeat(270));
+        assert_eq!(move_path(Path::new(&long)).unwrap(), units(&format!(r"\\?\{long}")));
+        let unc = format!(r"\\server\share\{}\file.bin", "d".repeat(270));
+        assert_eq!(move_path(Path::new(&unc)).unwrap(), units(&format!(r"\\?\UNC\server\share\{}\file.bin", "d".repeat(270))));
+        // short, verbatim and device paths stay as they are
+        assert_eq!(move_path(Path::new(r"C:\a\b.bin")).unwrap(), units(r"C:\a\b.bin"));
+        let verbatim = format!(r"\\?\C:\{}\file.bin", "d".repeat(270));
+        assert_eq!(move_path(Path::new(&verbatim)).unwrap(), units(&verbatim));
+        let device = format!(r"\\.\C:\{}\file.bin", "d".repeat(270));
+        assert_eq!(move_path(Path::new(&device)).unwrap(), units(&device));
+        // 259 characters is the longest MoveFileExW takes without the prefix
+        let edge = format!(r"C:\{}", "d".repeat(256));
+        assert_eq!(edge.len(), 259);
+        assert_eq!(move_path(Path::new(&edge)).unwrap(), units(&edge));
+        // 260 is the first length that needs it
+        let edge = format!(r"C:\{}", "d".repeat(257));
+        assert_eq!(edge.len(), 260);
+        assert_eq!(move_path(Path::new(&edge)).unwrap(), units(&format!(r"\\?\{edge}")));
+        // an already verbatim UNC path is not prefixed twice
+        let verbatim_unc = format!(r"\\?\UNC\server\share\{}", "d".repeat(270));
+        assert_eq!(move_path(Path::new(&verbatim_unc)).unwrap(), units(&verbatim_unc));
+        // `..` is folded before the length decides
+        assert_eq!(move_path(Path::new(r"C:\a\..\b")).unwrap(), units(r"C:\b"));
+    }
+
+    /// Without the prefix `MoveFileExW` failed this with "The system cannot find the path
+    /// specified" (error 3) although the folder and the temporary file exist.
+    #[test]
+    fn atomic_write_commits_past_max_path() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("xcl-rpf-long-{}-{nonce}", std::process::id()));
+        let dir = root.join("d".repeat(120)).join("e".repeat(120)).join("f".repeat(60));
+        std::fs::create_dir_all(&dir).unwrap();
+        let output = dir.join("record.bin");
+        assert!(output.as_os_str().len() >= 300, "the test needs a path past MAX_PATH");
+
+        atomic_write(&output, b"payload").unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), b"payload");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no temporary file is left");
 
         std::fs::remove_dir_all(root).unwrap();
     }
