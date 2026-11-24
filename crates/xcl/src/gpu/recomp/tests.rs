@@ -2761,6 +2761,56 @@ fn gpu_valu_16_and_64_bit() {
     assert_eq!(r.sgpr[22] as u64 | (r.sgpr[23] as u64) << 32, carries, "v_mad_u64_u32 carry mask");
 }
 
+/// NEG_HI[2] of v_dot2_f32_f16 is the ABS of its f32 accumulator (SRC2), applied before NEG[2]
+/// (LLVM `SIDefines.h` `NEG_HI = ABS`; `llvm.amdgcn.fdot2.ll` `v_fdot2_abs_c`: `neg_hi:[0,0,1]`).
+#[test]
+fn dot2_f32_f16_neg_hi_on_src2_is_abs() {
+    let hlsl = |neg: u64, neg_hi: u64| {
+        let code = prog(&[(
+            "V_DOT2_F32_F16",
+            "ENC_VOP3P",
+            &[("VDST", 4), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1), ("NEG", neg), ("NEG_HI", neg_hi)],
+            None,
+        )]);
+        let t = translate(&code, &Options::default()).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        t.hlsl
+    };
+    let plain = hlsl(0, 0);
+    assert!(plain.contains("asfloat(v3)") && !plain.contains("abs(asfloat(v3))"), "{plain}");
+    let abs = hlsl(0, 0b100);
+    assert!(abs.contains("abs(asfloat(v3))") && !abs.contains("(-abs(asfloat(v3)))"), "{abs}");
+    let neg_abs = hlsl(0b100, 0b100);
+    assert!(neg_abs.contains("(-abs(asfloat(v3)))"), "{neg_abs}");
+}
+
+/// v_dot2_f32_f16 with ABS (NEG_HI[2]) and NEG (NEG[2]) on the f32 accumulator: 1·1 + 1·1 + c.
+#[test]
+fn gpu_dot2_f32_f16_abs_neg_on_src2() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[
+            // neg_hi:[0,0,1]: 2 + |c|
+            ("V_DOT2_F32_F16", "ENC_VOP3P", &[("VDST", 4), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1), ("NEG_HI", 0b100)], None),
+            // neg_lo:[0,0,1] neg_hi:[0,0,1]: 2 - |c|
+            ("V_DOT2_F32_F16", "ENC_VOP3P", &[("VDST", 5), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1), ("NEG", 0b100), ("NEG_HI", 0b100)], None),
+            // neg_lo:[0,0,1]: 2 - c
+            ("V_DOT2_F32_F16", "ENC_VOP3P", &[("VDST", 6), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1), ("NEG", 0b100)], None),
+        ]);
+        let mut st = KernelState::default();
+        for r in st.vgpr.iter_mut() {
+            r[1] = 0x3C00_3C00; // 1.0h, 1.0h
+            r[2] = 0x3C00_3C00;
+            r[3] = f(-5.0);
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            assert_eq!(v[4], f(7.0), "wave{lanes} lane {l} v_dot2_f32_f16 neg_hi:[0,0,1]");
+            assert_eq!(v[5], f(-3.0), "wave{lanes} lane {l} v_dot2_f32_f16 neg_lo:[0,0,1] neg_hi:[0,0,1]");
+            assert_eq!(v[6], f(7.0), "wave{lanes} lane {l} v_dot2_f32_f16 neg_lo:[0,0,1]");
+        }
+    }
+}
+
 #[test]
 fn gpu_packed_math_dots_movrel() {
     if !gpu_ready() {
