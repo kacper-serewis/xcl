@@ -279,6 +279,8 @@ struct Bindings {
     index_title: Option<(u64, u32, i32)>,
     /// the title set the console's rect list topology
     rect_list: bool,
+    /// #31 SetPredication as the PC list got it: (buffer, PC offset, operation)
+    predication: Option<(usize, u64, D3D12_PREDICATION_OP)>,
 }
 
 /// Whether `list` draws rect lists now, and the title's vertex buffers (slot, (address, bytes, stride)).
@@ -509,6 +511,9 @@ unsafe fn restore_bindings(this: *mut c_void, b: &Bindings, ty: D3D12_COMMAND_LI
     }
     if !b.heaps.is_empty() {
         pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, 28)(this, b.heaps.len() as u32, b.heaps.as_ptr());
+    }
+    if let Some((res, off, op)) = b.predication {
+        pc::<unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP)>(this, PC_SET_PREDICATION)(this, res, off, op);
     }
     if ty != D3D12_COMMAND_LIST_TYPE_DIRECT {
         return;
@@ -2806,7 +2811,7 @@ unsafe fn apply_predication_copy(this: *mut c_void, uma_buf: usize, off: u64, pb
         .unwrap()
         .as_ref()
         .and_then(|m| m.get(&(this as usize)))
-        .map_or((false, false), |s| (s.predication.is_some(), s.pred_in_state));
+        .map_or((false, false), |s| (s.predication.is_some() || s.bindings.predication.is_some(), s.pred_in_state));
     // Disarm any active predicate before copying the new predicate value so a failing predicate
     // does not suppress `CopyBufferRegion` when switching directly between buffers.
     if was_active {
@@ -2823,6 +2828,7 @@ unsafe fn apply_predication_copy(this: *mut c_void, uma_buf: usize, off: u64, pb
     if let Some(s) = LISTS.lock().unwrap().get_or_insert_with(HashMap::new).get_mut(&(this as usize)) {
         s.predication = Some(op);
         s.pred_in_state = true;
+        s.bindings.predication = None;
     }
 }
 
@@ -2845,6 +2851,7 @@ pub unsafe extern "system" fn set_predication_buffer_x(this: *mut c_void, desc: 
             let mut g = LISTS.lock().unwrap();
             g.as_mut().and_then(|m| m.get_mut(&(this as usize))).and_then(|s| {
                 s.predication = None;
+                s.bindings.predication = None;
                 if s.pred_in_state {
                     s.pred_in_state = false;
                     s.pred_buf.as_ref().map(|r| r.as_raw() as usize)
@@ -4064,9 +4071,18 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
 
 /// command list #31 SetPredication(buffer, offset, operation) (PC #55): buffers placed below
 /// their console address add `buffer_delta(buffer)` to the offset, as ResolveQueryData does, so
-/// the predicate is read where the resolve wrote it.
+/// the predicate is read where the resolve wrote it. Kept for KickoffX and mid-list splits
+/// (`restore_bindings`).
 pub(super) unsafe extern "system" fn set_predication_x(this: *mut c_void, res: usize, offset: u64, op: D3D12_PREDICATION_OP) {
     let pc_offset = offset.saturating_add(real::buffer_delta(res));
+    {
+        let mut g = LISTS.lock().unwrap();
+        let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
+        s.bindings.predication = (res != 0).then_some((res, pc_offset, op));
+        // the last of #31 and #85 SetPredicationBufferX is the one in effect (#85's buffer goes
+        // back to COMMON at Close or KickoffX: `pred_in_state`)
+        s.predication = None;
+    }
     type F = unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP);
     pc::<F>(this, PC_SET_PREDICATION)(this, res, pc_offset, op);
 }
@@ -5311,6 +5327,90 @@ mod tests {
 
         assert_eq!(*fake.calls.lock().unwrap(), vec![(res, 0x210, 0), (0, 0, 0)]);
         on_release(list_ptr as usize);
+    }
+
+    /// Predication set through #31 is set again after the PC Reset of KickoffX or a mid-list split
+    /// (`restore_bindings`), on direct and compute lists, at the PC offset it was set with. A null
+    /// buffer leaves nothing to restore, and the last of #31 / #85 SetPredicationBufferX is the
+    /// one in effect.
+    #[test]
+    fn set_predication_x_is_restored_after_a_pc_reset() {
+        #[repr(C)]
+        struct FakePredList {
+            vt: *const usize,
+            calls: Mutex<Vec<(usize, u64, i32)>>,
+        }
+
+        unsafe extern "system" fn fake_get_type(_this: *mut c_void) -> D3D12_COMMAND_LIST_TYPE {
+            D3D12_COMMAND_LIST_TYPE_DIRECT
+        }
+
+        unsafe extern "system" fn fake_resource_barrier(_this: *mut c_void, _count: u32, _barriers: *const D3D12_RESOURCE_BARRIER) {}
+
+        unsafe extern "system" fn fake_copy_buffer_region(_this: *mut c_void, _dst: usize, _dst_off: u64, _src: usize, _src_off: u64, _n: u64) {}
+
+        unsafe extern "system" fn fake_set_predication(this: *mut c_void, res: usize, off: u64, op: D3D12_PREDICATION_OP) {
+            (*(this as *const FakePredList)).calls.lock().unwrap().push((res, off, op.0));
+        }
+
+        let mut orig_vt = [0usize; 64];
+        orig_vt[PC_GET_TYPE] = fake_get_type as usize;
+        orig_vt[PC_COPY_BUFFER_REGION] = fake_copy_buffer_region as usize;
+        orig_vt[PC_RESOURCE_BARRIER] = fake_resource_barrier as usize;
+        orig_vt[PC_SET_PREDICATION] = fake_set_predication as usize;
+        let ext_vt = [orig_vt.as_ptr() as usize, 0];
+        let fake = Box::new(FakePredList {
+            // SAFETY: `ext_vt` has 2 entries so `.add(1)` has `orig_vt` at `-1` as `real::orig_fn` expects.
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            calls: Mutex::new(Vec::new()),
+        });
+        let list_ptr = &*fake as *const FakePredList as *mut c_void;
+        let res = 0x31_6000usize;
+        let (uma_buf, pb) = (0x31_7000usize, 0x31_8000usize);
+        let take = || std::mem::take(&mut *fake.calls.lock().unwrap());
+        let restore = |ty: D3D12_COMMAND_LIST_TYPE| {
+            let b = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list_ptr as usize))).map(|s| s.bindings.clone()).unwrap_or_default();
+            take();
+            unsafe { restore_bindings(list_ptr, &b, ty) };
+            take()
+        };
+        let pred_85 = || LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list_ptr as usize))).and_then(|s| s.predication);
+
+        real::set_test_buffer_delta(res, Some(0x200));
+        let (direct, compute, null_restored, after_85, disarm, after_31, after_null_85);
+        unsafe {
+            set_predication_x(list_ptr, res, 0x10, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO);
+            direct = restore(D3D12_COMMAND_LIST_TYPE_DIRECT);
+            compute = restore(D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            set_predication_x(list_ptr, 0, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+            null_restored = restore(D3D12_COMMAND_LIST_TYPE_DIRECT);
+
+            // #85 after #31: the copy into the predication buffer runs unpredicated, and only
+            // #85's state is restored (by KickoffX itself)
+            set_predication_x(list_ptr, res, 0x10, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO);
+            take();
+            apply_predication_copy(list_ptr, uma_buf, 0x100, pb, D3D12_PREDICATION_OP_EQUAL_ZERO);
+            disarm = take();
+            after_85 = (restore(D3D12_COMMAND_LIST_TYPE_DIRECT), pred_85());
+
+            // #31 after #85: only #31's is restored
+            set_predication_x(list_ptr, res, 0x10, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO);
+            after_31 = (restore(D3D12_COMMAND_LIST_TYPE_DIRECT), pred_85());
+
+            // #85 with no descriptor turns predication off: nothing to restore
+            set_predication_buffer_x(list_ptr, std::ptr::null());
+            after_null_85 = restore(D3D12_COMMAND_LIST_TYPE_DIRECT);
+        }
+        real::set_test_buffer_delta(res, None);
+        on_release(list_ptr as usize);
+
+        assert_eq!(direct, vec![(res, 0x210, 1)]);
+        assert_eq!(compute, vec![(res, 0x210, 1)]);
+        assert!(null_restored.is_empty());
+        assert_eq!(disarm, vec![(0, 0, 0), (pb, 0, 0)]);
+        assert_eq!(after_85, (vec![], Some(D3D12_PREDICATION_OP_EQUAL_ZERO)));
+        assert_eq!(after_31, (vec![(res, 0x210, 1)], None));
+        assert!(after_null_85.is_empty());
     }
 
     /// Write64BitValueBottomOfPipeX / Write64BitValueTopOfPipeX with timestamp flags targeting
