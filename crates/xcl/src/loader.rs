@@ -380,6 +380,31 @@ pub fn run_main(m: &Arc<MappedModule>) -> u32 {
     }
 }
 
+/// DLL_THREAD_ATTACH (2) / DETACH (3) for the mapped modules: their TLS callbacks and DllMains.
+/// Only for modules that are ready – the executable, and DLLs whose PROCESS_ATTACH has run – as
+/// Windows' loader does: a DLL that is still being mapped (by a `LoadLibrary` of the title's
+/// while another thread starts) may not be executable yet, nor set up for its callbacks.
+unsafe fn thread_event(modules: &[Arc<MappedModule>], reason: u32) {
+    let ready = |m: &MappedModule| !m.is_dll || m.initialized.load(Ordering::Acquire);
+    let dll_main = |m: &MappedModule| {
+        if m.is_dll && m.initialized.load(Ordering::Acquire) && !m.no_thread_calls.load(Ordering::Relaxed) && m.entry_rva != 0 {
+            let f: DllMain = std::mem::transmute(m.base + m.entry_rva as usize);
+            f(m.base as *mut c_void, reason, std::ptr::null_mut());
+        }
+    };
+    if reason == 2 {
+        for m in modules.iter().filter(|m| ready(m)) {
+            run_tls_callbacks(m, 2);
+            dll_main(m);
+        }
+    } else {
+        for m in modules.iter().rev().filter(|m| ready(m)) {
+            dll_main(m);
+            run_tls_callbacks(m, 3);
+        }
+    }
+}
+
 /// Called from xcl.exe's own TLS callback for every thread event in the process.
 pub fn on_tls_event(reason: u32) {
     match reason {
@@ -389,26 +414,14 @@ pub fn on_tls_event(reason: u32) {
             if !READY.load(Ordering::Acquire) {
                 return;
             }
-            for m in modules::mapped_modules() {
-                run_tls_callbacks(&m, 2);
-                if m.is_dll && m.initialized.load(Ordering::Acquire) && !m.no_thread_calls.load(Ordering::Relaxed) && m.entry_rva != 0 {
-                    let f: DllMain = std::mem::transmute(m.base + m.entry_rva as usize);
-                    f(m.base as *mut c_void, 2, std::ptr::null_mut());
-                }
-            }
+            thread_event(&modules::mapped_modules(), 2);
         },
         3 => unsafe {
             crate::tls::on_thread_detach();
             if !READY.load(Ordering::Acquire) {
                 return;
             }
-            for m in modules::mapped_modules().into_iter().rev() {
-                if m.is_dll && m.initialized.load(Ordering::Acquire) && !m.no_thread_calls.load(Ordering::Relaxed) && m.entry_rva != 0 {
-                    let f: DllMain = std::mem::transmute(m.base + m.entry_rva as usize);
-                    f(m.base as *mut c_void, 3, std::ptr::null_mut());
-                }
-                run_tls_callbacks(&m, 3);
-            }
+            thread_event(&modules::mapped_modules(), 3);
         },
         0 => {
             // DLL_PROCESS_DETACH (ExitProcess): write the report while everything is alive.
@@ -482,6 +495,44 @@ mod tests {
         let p = dir.join(name);
         std::fs::write(&p, bytes).unwrap();
         p
+    }
+
+    /// A DLL still being mapped – registered, its TLS callbacks read, not yet through
+    /// PROCESS_ATTACH (its code may not be executable yet) – gets no thread callbacks; once it is
+    /// initialised it does, as the executable always does.
+    #[test]
+    fn thread_callbacks_wait_for_a_dll_to_be_initialised() {
+        use std::sync::atomic::AtomicU32;
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        unsafe extern "system" fn callback(_base: *mut c_void, reason: u32, _r: *mut c_void) {
+            CALLS.fetch_add(reason, Ordering::Relaxed);
+        }
+        let module = |is_dll: bool| {
+            Arc::new(MappedModule {
+                name: "xcl_tls_wait.dll".into(),
+                path: PathBuf::new(),
+                base: 0,
+                size: 0,
+                entry_rva: 0,
+                is_dll,
+                exports: Default::default(),
+                tls_callbacks: Mutex::new(vec![callback as usize]),
+                no_thread_calls: AtomicBool::new(false),
+                initialized: AtomicBool::new(false),
+                stack_reserve: 0,
+            })
+        };
+        let dll = module(true);
+        unsafe { thread_event(&[dll.clone()], 2) };
+        unsafe { thread_event(&[dll.clone()], 3) };
+        assert_eq!(CALLS.load(Ordering::Relaxed), 0, "callbacks of a DLL not initialised yet");
+        dll.initialized.store(true, Ordering::Release);
+        unsafe { thread_event(&[dll.clone()], 2) };
+        unsafe { thread_event(&[dll], 3) };
+        assert_eq!(CALLS.load(Ordering::Relaxed), 2 + 3);
+        // the executable (never marked initialised) gets them
+        unsafe { thread_event(&[module(false)], 2) };
+        assert_eq!(CALLS.load(Ordering::Relaxed), 2 + 3 + 2);
     }
 
     /// DllMain returning FALSE: the load fails, the DLL is not left registered as loaded, and a
