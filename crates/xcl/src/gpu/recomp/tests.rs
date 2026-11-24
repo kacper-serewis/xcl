@@ -2429,6 +2429,237 @@ fn gpu_images_sample_load_store_atomic() {
     assert_eq!(u32::from_le_bytes(r.textures[2][..4].try_into().unwrap()), 64, "image_atomic_inc (64 lanes, limit 100)");
 }
 
+/// An image atomic with DMASK 0x3 (0xF for cmpswap) works on 64 bits: VDATA[0:1] against the
+/// texel's two dwords (R32G32_UINT, SM 6.6 uint64_t typed atomics). Verifies add (with carry +
+/// GLC return), umax, smin, cmpswap (DMASK 0xF + GLC return), inc, refusal when the adapter
+/// lacks 64-bit typed atomics, and refusal on invalid DMASK.
+#[test]
+fn gpu_image_atomics_64_bit() {
+    let mimg = |name: &'static str, f: &[(&str, u64)]| -> Vec<u8> { encode(name, "ENC_MIMG", f, None).unwrap() };
+
+    // CPU checks: capability refusal and invalid DMASK refusal.
+    let mut add64_only = Vec::new();
+    add64_only.extend(mimg("IMAGE_ATOMIC_ADD", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1)]));
+    add64_only.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let refused = translate(&add64_only, &Options { int64_typed_atomic: false, ..Default::default() }).unwrap();
+    assert!(!refused.complete(), "64-bit image atomic must be refused when adapter lacks int64_typed_atomic");
+    assert!(refused.unsupported.keys().any(|k| k.contains("image_atomic_add")), "{:?}", refused.unsupported_why);
+
+    let mut bad_dmask = Vec::new();
+    bad_dmask.extend(mimg("IMAGE_ATOMIC_ADD", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x5), ("DIM", 1), ("UNORM", 1)]));
+    bad_dmask.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let refused_dm = translate(&bad_dmask, &Options::default()).unwrap();
+    assert!(!refused_dm.complete(), "invalid image_atomic DMASK 0x5 must be refused");
+
+    // 32-bit fcmpswap (DMASK 0x3) stays on the 32-bit path even without 64-bit typed atomics;
+    // 64-bit float min/max (DMASK 0x3) is refused cleanly.
+    let mut fcmpswap32 = Vec::new();
+    fcmpswap32.extend(mimg("IMAGE_ATOMIC_FCMPSWAP", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1)]));
+    fcmpswap32.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let t_fcmpswap32 = translate(&fcmpswap32, &Options { int64_typed_atomic: false, ..Default::default() }).unwrap();
+    assert!(t_fcmpswap32.complete(), "32-bit image_atomic_fcmpswap must translate without int64_typed_atomic: {:?}", t_fcmpswap32.unsupported_why);
+
+    let mut fmin64 = Vec::new();
+    fmin64.extend(mimg("IMAGE_ATOMIC_FMIN", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1)]));
+    fmin64.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let t_fmin64 = translate(&fmin64, &Options::default()).unwrap();
+    assert!(!t_fmin64.complete(), "64-bit image_atomic_fmin must be refused");
+
+    // 64-bit smin/smax emit native int64_t InterlockedMin/InterlockedMax (no CAS loop).
+    let mut signed64 = Vec::new();
+    signed64.extend(mimg("IMAGE_ATOMIC_SMIN", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    signed64.extend(mimg("IMAGE_ATOMIC_SMAX", &[("VDATA", 12), ("VADDR", 0), ("SRSRC", 6), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    signed64.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let t_signed64 = translate(&signed64, &Options::default()).unwrap();
+    assert!(t_signed64.complete(), "{:?}", t_signed64.unsupported_why);
+    assert!(t_signed64.hlsl.contains("RWTexture2D<int64_t>"), "64-bit smin/smax must use int64_t view");
+    assert!(t_signed64.hlsl.contains("InterlockedMin(") && t_signed64.hlsl.contains("InterlockedMax("));
+    assert!(!t_signed64.hlsl.contains("InterlockedCompareExchange("), "64-bit smin/smax must not use CAS loop");
+
+    // 64-bit inc/dec seed CAS with 0 instead of an optional typed UAV load.
+    let mut incdec64 = Vec::new();
+    incdec64.extend(mimg("IMAGE_ATOMIC_INC", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1)]));
+    incdec64.extend(mimg("IMAGE_ATOMIC_DEC", &[("VDATA", 12), ("VADDR", 0), ("SRSRC", 6), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1)]));
+    incdec64.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let t_incdec64 = translate(&incdec64, &Options::default()).unwrap();
+    assert!(t_incdec64.complete(), "{:?}", t_incdec64.unsupported_why);
+    assert_eq!(t_incdec64.hlsl.matches("_c = 0;").count(), 2, "both 64-bit inc and dec CAS loops must seed with 0");
+    assert_eq!(t_incdec64.hlsl.matches("[allow_uav_condition] while (true)").count(), 2, "retry until compare-exchange succeeds");
+    assert_eq!(t_incdec64.hlsl.matches("InterlockedCompareExchange(").count(), 2, "64-bit inc and dec both use CAS loops");
+
+    if !gpu_ready() {
+        return;
+    }
+    if !runner::int64_typed_atomic_supported() {
+        runner::skip_test("no int64 typed image atomics");
+        return;
+    }
+
+    use runner::{TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_UINT;
+    let mut code = Vec::new();
+    // tex0..4: 1x1 32_32_UINT UAVs at T# SRSRC 4, 6, 8, 10, 12 (heap indices 0, 2, 4, 6, 8).
+    code.extend(mimg("IMAGE_ATOMIC_ADD", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_UMAX", &[("VDATA", 12), ("VADDR", 0), ("SRSRC", 6), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_SMIN", &[("VDATA", 14), ("VADDR", 0), ("SRSRC", 8), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_CMPSWAP", &[("VDATA", 16), ("VADDR", 0), ("SRSRC", 10), ("DMASK", 0xF), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_INC", &[("VDATA", 20), ("VADDR", 0), ("SRSRC", 12), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+    let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
+    assert!(t.complete(), "64-bit image atomics must translate cleanly: {:?}", t.unsupported_why);
+
+    let mut st = KernelState::default();
+    for i in 0..5usize {
+        st.sgpr[16 + i * 8..24 + i * 8].copy_from_slice(&tsharp((i * 2) as u32, 62, 9));
+    }
+    let init_cmp: u64 = 0x1122_3344_5566_7788;
+    let swap_new: u64 = 0xDEAD_BEEF_CAFE_BABE;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = 0;
+        r[1] = 0;
+        // add 2^32 - 1 per lane: sum carries into high dword, GLC returns distinct 64-bit old values
+        r[10] = 0xFFFF_FFFF;
+        r[11] = 0;
+        // umax: (l << 32) | (1000 - l) -> largest u64 is lane 63
+        r[12] = 1000 - l as u32;
+        r[13] = l as u32;
+        // smin: lane 42 offers -(1 << 40), others offer positive or smaller-magnitude negative
+        let sv: i64 = if l == 42 { -(1i64 << 40) } else { (l as i64) - 10 };
+        r[14] = sv as u32;
+        r[15] = (sv as u64 >> 32) as u32;
+        // cmpswap (DMASK 0xF): VDATA[0:1] = new, VDATA[2:3] = cmp; only lane 17 matches init_cmp
+        let new_v = if l == 17 { swap_new } else { 0xBAD0_0000_0000_0000 | l as u64 };
+        let cmp_v = if l == 17 { init_cmp } else { init_cmp ^ ((l as u64 + 1) << 32) };
+        r[16] = new_v as u32;
+        r[17] = (new_v >> 32) as u32;
+        r[18] = cmp_v as u32;
+        r[19] = (cmp_v >> 32) as u32;
+        // inc: 64 lanes with high 64-bit limit (no wrap)
+        r[20] = 0xFFFF_FFFF;
+        r[21] = 0x10;
+    }
+    let tex = vec![
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32_UINT, width: 1, height: 1, depth: 1, texel_bytes: 8, data: vec![0; 8], uav: true },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32_UINT, width: 1, height: 1, depth: 1, texel_bytes: 8, data: vec![0; 8], uav: true },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32_UINT, width: 1, height: 1, depth: 1, texel_bytes: 8, data: (100i64).to_le_bytes().to_vec(), uav: true },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32_UINT, width: 1, height: 1, depth: 1, texel_bytes: 8, data: init_cmp.to_le_bytes().to_vec(), uav: true },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32_UINT, width: 1, height: 1, depth: 1, texel_bytes: 8, data: (0x0000_0001_FFFF_FFFEu64).to_le_bytes().to_vec(), uav: true },
+    ];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
+    let texel = |i: usize| u64::from_le_bytes(r.textures[i][..8].try_into().unwrap());
+    let lanes = st.vgpr.len() as u64;
+    assert_eq!(texel(0), lanes * 0xFFFF_FFFF, "image_atomic_add 64-bit");
+    assert_eq!(texel(1), ((lanes - 1) << 32) | (1000 - (lanes - 1)), "image_atomic_umax 64-bit");
+    assert_eq!(texel(2) as i64, -(1i64 << 40), "image_atomic_smin 64-bit");
+    assert_eq!(texel(3), swap_new, "image_atomic_cmpswap 64-bit");
+    assert_eq!(texel(4), 0x0000_0001_FFFF_FFFEu64 + lanes, "image_atomic_inc 64-bit across 32-bit carry");
+
+    // Verify GLC returned all 64 unique previous sums for add (multiples 0..63 of 0xFFFF_FFFF).
+    let mut old_adds: Vec<u64> = r.vgpr.iter().map(|v| (v[10] as u64) | ((v[11] as u64) << 32)).collect();
+    old_adds.sort_unstable();
+    let want_adds: Vec<u64> = (0..lanes).map(|k| k * 0xFFFF_FFFF).collect();
+    assert_eq!(old_adds, want_adds, "image_atomic_add GLC 64-bit return values");
+
+    // Verify lane 17 received init_cmp as its GLC cmpswap return value.
+    let lane17_old = (r.vgpr[17][16] as u64) | ((r.vgpr[17][17] as u64) << 32);
+    assert_eq!(lane17_old, init_cmp, "image_atomic_cmpswap GLC 64-bit return value");
+}
+
+// One dispatch per opcode so DXC errors and incorrect texels are attributed independently.
+fn run_image_atomic64(op: &'static str, initial: u64, operand: impl Fn(usize) -> u64) -> Option<(u64, Vec<u64>)> {
+    use runner::{TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_UINT;
+    if !gpu_ready() {
+        return None;
+    }
+    if !runner::int64_typed_atomic_supported() {
+        runner::skip_test("no int64 typed image atomics");
+        return None;
+    }
+    let mask = if op == "IMAGE_ATOMIC_CMPSWAP" { 0xf } else { 3 };
+    let mut code = encode(op, "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4),
+        ("DMASK", mask), ("DIM", 1), ("UNORM", 1), ("GLC", 1)], None).unwrap();
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 62, 9));
+    for (lane, v) in st.vgpr.iter_mut().enumerate() {
+        let data = operand(lane);
+        v[10] = data as u32;
+        v[11] = (data >> 32) as u32;
+        v[12] = initial as u32;
+        v[13] = (initial >> 32) as u32;
+    }
+    let tex = TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32_UINT,
+        width: 1, height: 1, depth: 1, texel_bytes: 8, data: initial.to_le_bytes().to_vec(), uav: true };
+    let result = runner::run_code_with(&code, &st, &[], &[tex], &[]).unwrap();
+    let old = result.vgpr.iter().map(|v| u64::from(v[10]) | (u64::from(v[11]) << 32)).collect();
+    Some((u64::from_le_bytes(result.textures[0][..8].try_into().unwrap()), old))
+}
+
+#[test]
+fn gpu_image_atomic64_add() {
+    let step = u64::from(u32::MAX);
+    let Some((sum, mut old)) = run_image_atomic64("IMAGE_ATOMIC_ADD", 0, |_| step) else { return };
+    assert_eq!(sum, 64 * step);
+    old.sort_unstable();
+    assert_eq!(old, (0..64).map(|i| i * step).collect::<Vec<_>>());
+}
+
+#[test]
+fn gpu_image_atomic64_umax() {
+    let value = |lane: usize| ((lane as u64) << 32) | (1000 - lane as u64);
+    let Some((max, _)) = run_image_atomic64("IMAGE_ATOMIC_UMAX", 0, value) else { return };
+    assert_eq!(max, value(63));
+}
+
+#[test]
+fn gpu_image_atomic64_cmpswap() {
+    let initial = 1 << 32;
+    let new = |lane: usize| ((lane as u64 + 2) << 32) | lane as u64;
+    let Some((swapped, old)) = run_image_atomic64("IMAGE_ATOMIC_CMPSWAP", initial, new) else { return };
+    let winner = old.iter().position(|&v| v == initial).expect("one lane swaps the initial texel");
+    assert_eq!(swapped, new(winner));
+    assert!(old.iter().enumerate().all(|(i, &v)| i == winner || v == swapped));
+}
+
+#[test]
+fn gpu_image_atomic64_smin() {
+    let value = |lane: usize| (-((lane as i64) << 32) - 1) as u64;
+    let Some((min, old)) = run_image_atomic64("IMAGE_ATOMIC_SMIN", 0, value) else { return };
+    assert_eq!(min, value(63));
+    assert_eq!(old.iter().filter(|&&v| v == 0).count(), 1);
+    assert!(old.iter().all(|&v| v == 0 || (0..64).any(|i| value(i) == v)));
+}
+
+#[test]
+fn gpu_image_atomic64_inc() {
+    let start = 0xffff_fff0;
+    let Some((end, mut old)) = run_image_atomic64("IMAGE_ATOMIC_INC", start, |_| 1 << 40) else { return };
+    assert_eq!(end, start + 64);
+    old.sort_unstable();
+    assert_eq!(old, (start..end).collect::<Vec<_>>());
+}
+
+#[test]
+fn gpu_image_atomic64_smax() {
+    let value = |lane: usize| (((lane as i64 - 32) << 32) | 1) as u64;
+    let initial = i64::MIN as u64;
+    let Some((max, old)) = run_image_atomic64("IMAGE_ATOMIC_SMAX", initial, value) else { return };
+    assert_eq!(max, value(63));
+    assert_eq!(old.iter().filter(|&&v| v == initial).count(), 1);
+    assert!(old.iter().all(|&v| v == initial || (0..64).any(|i| value(i) == v)));
+}
+
+#[test]
+fn gpu_image_atomic64_dec() {
+    let start = 0x1_0000_0010;
+    let Some((end, mut old)) = run_image_atomic64("IMAGE_ATOMIC_DEC", start, |_| 1 << 40) else { return };
+    assert_eq!(end, start - 64);
+    old.sort_unstable();
+    assert_eq!(old, (end + 1..=start).collect::<Vec<_>>());
+}
+
 /// Static samplers: the program builds two S# from constants (point / linear, clamp) – as
 /// the console compiler places a root signature's static samplers – and samples the same
 /// texel boundary with each; they become static samplers of the root signature.

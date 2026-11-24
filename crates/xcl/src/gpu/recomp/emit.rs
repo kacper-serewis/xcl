@@ -2491,37 +2491,97 @@ impl Em {
                     uav("float")
                 ));
             }
-            _ if base.starts_with("atomic_") && matches!(&base[7..], "cmpswap" | "sub" | "inc" | "dec" | "fcmpswap" | "fmin" | "fmax") => {
-                // the operations without an int view: on the uint texel (CAS loops where needed)
-                let (v, cmp) = (self.vreg(vdata), self.vreg(vdata + 1));
-                self.line(&format!("RWTexture{rty}<uint> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];"));
-                self.line(&format!("uint {t}_old = 0u;"));
-                let body = rmw32(&base[7..], &At::Ref(format!("{t}_U[{icoord}]")), &v, &cmp, &format!("{t}_old"), &t).ok_or("image_atomic")?;
-                self.line(&format!("if ({act}) {{ {body} }}"));
-                if f("GLC") == 1 {
-                    self.line(&format!("if ({act}) {v} = {t}_old;"));
-                }
-            }
             _ if base.starts_with("atomic_") => {
-                let op = match &base[7..] {
-                    "add" => "InterlockedAdd",
-                    "smin" | "umin" => "InterlockedMin",
-                    "smax" | "umax" => "InterlockedMax",
-                    "and" => "InterlockedAnd",
-                    "or" => "InterlockedOr",
-                    "xor" => "InterlockedXor",
-                    "swap" => "InterlockedExchange",
-                    _ => return Err("image_atomic"),
+                // RDNA2 MIMG atomic width is encoded in DMASK (LLVM SIISelLowering):
+                // cmpswap/fcmpswap: 0x3 = 32-bit (src, cmp), 0xF = 64-bit (src[0:1], cmp[2:3]);
+                // all other atomics: 0x1 = 32-bit (src), 0x3 = 64-bit (src[0:1]).
+                let op = &base[7..];
+                let is_cmpswap = matches!(op, "cmpswap" | "fcmpswap");
+                let is_64 = match (is_cmpswap, dmask) {
+                    (false, 0x1) | (true, 0x3) => false,
+                    (false, 0x3) | (true, 0xF) => true,
+                    _ => return Err("image_atomic dmask"),
                 };
-                let signed = base.ends_with("smin") || base.ends_with("smax");
-                let v = self.vreg(vdata);
-                let vt = if signed { "int" } else { "uint" };
-                let val = if signed { format!("(int){v}") } else { v.clone() };
-                self.line(&format!("RWTexture{rty}<{vt}> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];"));
-                self.line(&format!("{vt} {t}_old = 0;"));
-                self.line(&format!("if ({act}) {{ {op}({t}_U[{icoord}], {val}, {t}_old); }}"));
-                if f("GLC") == 1 {
-                    self.line(&format!("if ({act}) {v} = (uint){t}_old;"));
+                if is_64 {
+                    if !self.opt.int64_typed_atomic {
+                        return Err("image_atomic 64-bit");
+                    }
+                    if matches!(op, "fmin" | "fmax") {
+                        return Err("image_atomic 64-bit float min/max");
+                    }
+                    if !matches!(op, "add" | "sub" | "and" | "or" | "xor" | "swap" | "umin" | "umax" | "smin" | "smax" | "cmpswap" | "fcmpswap" | "inc" | "dec") {
+                        return Err("image_atomic 64-bit");
+                    }
+                    let (v0, v1) = (self.vreg(vdata), self.vreg(vdata + 1));
+                    self.line(&format!("uint64_t {t}_v = (uint64_t){v0} | ((uint64_t){v1} << 32);"));
+                    let cmp = if is_cmpswap {
+                        let (c0, c1) = (self.vreg(vdata + 2), self.vreg(vdata + 3));
+                        self.line(&format!("uint64_t {t}_cmp = (uint64_t){c0} | ((uint64_t){c1} << 32);"));
+                        format!("{t}_cmp")
+                    } else {
+                        String::new()
+                    };
+                    let signed = matches!(op, "smin" | "smax");
+                    let vt = if signed { "int64_t" } else { "uint64_t" };
+                    self.line(&format!("RWTexture{rty}<{vt}> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];"));
+                    self.line(&format!("{vt} {t}_old = 0;"));
+                    let u = format!("{t}_U[{icoord}]");
+                    let cas64 = |new: String| {
+                        format!(
+                            "uint64_t {t}_c = 0; [allow_uav_condition] while (true) {{ uint64_t {t}_n = {new}; uint64_t {t}_p = 0; InterlockedCompareExchange({u}, {t}_c, {t}_n, {t}_p); if ({t}_p == {t}_c) break; {t}_c = {t}_p; }} {t}_old = {t}_c;"
+                        )
+                    };
+                    let body = match op {
+                        "add" => format!("InterlockedAdd({u}, {t}_v, {t}_old);"),
+                        "sub" => format!("InterlockedAdd({u}, (uint64_t)0 - {t}_v, {t}_old);"),
+                        "and" => format!("InterlockedAnd({u}, {t}_v, {t}_old);"),
+                        "or" => format!("InterlockedOr({u}, {t}_v, {t}_old);"),
+                        "xor" => format!("InterlockedXor({u}, {t}_v, {t}_old);"),
+                        "swap" => format!("InterlockedExchange({u}, {t}_v, {t}_old);"),
+                        "umin" => format!("InterlockedMin({u}, {t}_v, {t}_old);"),
+                        "umax" => format!("InterlockedMax({u}, {t}_v, {t}_old);"),
+                        "smin" => format!("InterlockedMin({u}, (int64_t){t}_v, {t}_old);"),
+                        "smax" => format!("InterlockedMax({u}, (int64_t){t}_v, {t}_old);"),
+                        "cmpswap" | "fcmpswap" => format!("InterlockedCompareExchange({u}, {cmp}, {t}_v, {t}_old);"),
+                        "inc" => cas64(format!("({t}_c >= {t}_v) ? (uint64_t)0 : {t}_c + (uint64_t)1")),
+                        "dec" => cas64(format!("({t}_c == (uint64_t)0 || {t}_c > {t}_v) ? {t}_v : {t}_c - (uint64_t)1")),
+                        _ => unreachable!(),
+                    };
+                    self.line(&format!("if ({act}) {{ {body} }}"));
+                    if f("GLC") == 1 {
+                        self.line(&format!("if ({act}) {{ {v0} = (uint)(uint64_t){t}_old; {v1} = (uint)((uint64_t){t}_old >> 32); }}"));
+                    }
+                } else if matches!(op, "cmpswap" | "sub" | "inc" | "dec" | "fcmpswap" | "fmin" | "fmax") {
+                    // the operations without an int view: on the uint texel (CAS loops where needed)
+                    let (v, cmp) = (self.vreg(vdata), self.vreg(vdata + 1));
+                    self.line(&format!("RWTexture{rty}<uint> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];"));
+                    self.line(&format!("uint {t}_old = 0u;"));
+                    let body = rmw32(op, &At::Ref(format!("{t}_U[{icoord}]")), &v, &cmp, &format!("{t}_old"), &t).ok_or("image_atomic")?;
+                    self.line(&format!("if ({act}) {{ {body} }}"));
+                    if f("GLC") == 1 {
+                        self.line(&format!("if ({act}) {v} = {t}_old;"));
+                    }
+                } else {
+                    let iop = match op {
+                        "add" => "InterlockedAdd",
+                        "smin" | "umin" => "InterlockedMin",
+                        "smax" | "umax" => "InterlockedMax",
+                        "and" => "InterlockedAnd",
+                        "or" => "InterlockedOr",
+                        "xor" => "InterlockedXor",
+                        "swap" => "InterlockedExchange",
+                        _ => return Err("image_atomic"),
+                    };
+                    let signed = matches!(op, "smin" | "smax");
+                    let v = self.vreg(vdata);
+                    let vt = if signed { "int" } else { "uint" };
+                    let val = if signed { format!("(int){v}") } else { v.clone() };
+                    self.line(&format!("RWTexture{rty}<{vt}> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];"));
+                    self.line(&format!("{vt} {t}_old = 0;"));
+                    self.line(&format!("if ({act}) {{ {iop}({t}_U[{icoord}], {val}, {t}_old); }}"));
+                    if f("GLC") == 1 {
+                        self.line(&format!("if ({act}) {v} = (uint){t}_old;"));
+                    }
                 }
             }
             _ => return Err("MIMG"),

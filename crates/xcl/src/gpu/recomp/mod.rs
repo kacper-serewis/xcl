@@ -510,11 +510,16 @@ pub struct Options {
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
     /// always the guarded block chain)
     pub structured: bool,
+    /// the device supports SM 6.6 64-bit integer atomics on typed UAVs accessed through
+    /// `ResourceDescriptorHeap` (`OPTIONS9::AtomicInt64OnTypedResourceSupported` and
+    /// `OPTIONS11::AtomicInt64OnDescriptorHeapResourceSupported`); when false, 64-bit MIMG
+    /// image atomics are refused instead of silently running on 32 bits
+    pub int64_typed_atomic: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, int64_typed_atomic: true }
     }
 }
 
@@ -1280,14 +1285,14 @@ pub fn geometry_wave32_hazards(code: &[u8]) -> BTreeSet<&'static str> {
 /// Translate a complete ES+GS program; `split_wave64`: for a GPU with 32-lane waves only.
 /// `mem_windows`: the title's memory windows (`pso::mem_windows`), as for VS / PS / CS.
 pub fn translate_geometry(code: &[u8], interface: GsInterface, split_wave64: bool, mem_windows: u32) -> Result<Translation, String> {
-    translate(code, &Options { mode: Mode::Geometry(interface), wave64: true, split_wave64, mem_windows, ..Default::default() })
+    translate(code, &Options { mode: Mode::Geometry(interface), wave64: true, split_wave64, mem_windows, int64_typed_atomic: pso::int64_typed_atomic(), ..Default::default() })
 }
 
 /// Translate an NGG mesh program; `split_wave64`: for a GPU with 32-lane waves only;
 /// `mem_windows`: the title's memory windows (`pso::mem_windows`), as for VS / PS / CS – with
 /// one, a program reading title memory above the first window read the wrong memory.
 pub fn translate_mesh(code: &[u8], ms: MsInterface, wave64: bool, split_wave64: bool, mem_windows: u32) -> Result<Translation, String> {
-    translate(code, &Options { mode: Mode::Mesh(ms), wave64, split_wave64, mem_windows, ..Default::default() })
+    translate(code, &Options { mode: Mode::Mesh(ms), wave64, split_wave64, mem_windows, int64_typed_atomic: pso::int64_typed_atomic(), ..Default::default() })
 }
 
 /// Wave size the program was compiled for: 64-bit EXEC/VCC writes mean wave64.

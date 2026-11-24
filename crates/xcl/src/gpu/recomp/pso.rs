@@ -142,7 +142,8 @@ pub fn console_to_dxil_for(blob: &[u8], stage: Stage, sampler_base: u32, split_w
 /// `console_to_dxil_for` with the title's memory windows given (`xcl shaders --precompile`
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
-    let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
+    let int64_typed_atomic = int64_typed_atomic();
+    let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64, int64_typed_atomic);
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
         return compile_one();
     }
@@ -154,9 +155,10 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
         sampler_base,
         windows,
         split_wave64,
+        int64_typed_atomic,
         cache_dir: dxc::cache_dir(),
     };
-    let from_disk = || translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one);
+    let from_disk = || translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, int64_typed_atomic, compile_one);
     cached_shader(cache, key, blob, from_disk).map(|shader| shader.as_ref().clone())
 }
 
@@ -202,11 +204,12 @@ mod translated {
         b.iter().fold(0x9E37_79B9_7F4A_7C15u64, |h, &x| (h ^ x as u64).wrapping_mul(0xFF51_AFD7_ED55_8CCD).rotate_left(29))
     }
 
-    pub(super) fn file(dir: &Path, ident: u64, blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split: bool) -> PathBuf {
+    pub(super) fn file(dir: &Path, ident: u64, blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split: bool, int64_typed_atomic: bool) -> PathBuf {
+        let suffix = if int64_typed_atomic { "" } else { "_noi64a" };
         dir.join("translated")
             .join("v2")
             .join(format!("{ident:016x}"))
-            .join(format!("{:016x}_{stage:?}_{sampler_base}_{windows}_{}.bin", crate::gpu::shader::fnv64(blob), split as u8))
+            .join(format!("{:016x}_{stage:?}_{sampler_base}_{windows}_{}{suffix}.bin", crate::gpu::shader::fnv64(blob), split as u8))
     }
 
     fn header(ident: u64, blob: &[u8]) -> Vec<u8> {
@@ -263,12 +266,13 @@ mod translated {
         sampler_base: u32,
         windows: u32,
         split: bool,
+        int64_typed_atomic: bool,
         translate: impl FnOnce() -> Result<Compiled, String>,
     ) -> Result<Compiled, String> {
         if ident == 0 {
             return translate();
         }
-        let path = file(dir, ident, blob, stage, sampler_base, windows, split);
+        let path = file(dir, ident, blob, stage, sampler_base, windows, split, int64_typed_atomic);
         if let Some(c) = load_in(&path, ident, blob) {
             super::dxc::note_memory_hit();
             return Ok(c);
@@ -286,16 +290,17 @@ mod translated {
         sampler_base: u32,
         windows: u32,
         split: bool,
+        int64_typed_atomic: bool,
         translate: impl FnOnce() -> Result<Compiled, String>,
     ) -> Result<Compiled, String> {
-        cached_in(dir, identity(), blob, stage, sampler_base, windows, split, translate)
+        cached_in(dir, identity(), blob, stage, sampler_base, windows, split, int64_typed_atomic, translate)
     }
 }
 
 // Changes here, in `fspx`, or in `console_translation` that alter the cached result must bump
 // `TRANSLATION_GLUE_REVISION` in build.rs; cache serialization changes need not bump it.
-fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
-    let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64)?;
+fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool, int64_typed_atomic: bool) -> Result<Compiled, String> {
+    let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64, int64_typed_atomic)?;
     if let Some([r, g, b]) = (stage == Stage::Pixel).then(|| debug_color(blob)).flatten() {
         t.hlsl = t.hlsl.replacen("    return xo;\n}", &format!("    xo.t0 = float4({r:.3}, {g:.3}, {b:.3}, 1.0);\n    return xo;\n}}"), 1);
     }
@@ -384,7 +389,7 @@ fn debug_color(blob: &[u8]) -> Option<[f32; 3]> {
 
 /// The HLSL (and its DXC profile) `console_to_dxil` compiles.
 pub fn console_to_hlsl(blob: &[u8], stage: Stage) -> Result<(String, &'static str), String> {
-    console_translation(blob, stage, 0, mem_windows(), false).map(|(t, p)| (t.hlsl, p))
+    console_translation(blob, stage, 0, mem_windows(), false, int64_typed_atomic()).map(|(t, p)| (t.hlsl, p))
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -394,6 +399,7 @@ struct ShaderKey {
     sampler_base: u32,
     windows: u32,
     split_wave64: bool,
+    int64_typed_atomic: bool,
     cache_dir: PathBuf,
 }
 
@@ -511,13 +517,13 @@ pub fn compute_user_sgprs(blob: &[u8]) -> Option<u32> {
     }
 }
 
-fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(super::Translation, &'static str), String> {
+fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool, int64_typed_atomic: bool) -> Result<(super::Translation, &'static str), String> {
     if let Some(f) = fspx(blob) {
         if stage != Stage::Compute {
             return Err("an FSPX (driver) container in a graphics slot".into());
         }
         let cs = super::CsInterface::from_rsrc2(f.threads, f.rsrc2);
-        let t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+        let t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, int64_typed_atomic, ..Default::default() })?;
         if !t.complete() {
             let missing: Vec<&String> = t.unsupported.keys().collect();
             return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -545,7 +551,7 @@ fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u3
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+    let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, int64_typed_atomic, ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -627,6 +633,37 @@ fn wave_range(device: &ID3D12Device) -> Option<(u32, u32)> {
     }
     .ok()
     .map(|_| (options.WaveLaneCountMin, options.WaveLaneCountMax))
+}
+
+/// Whether the device supports SM 6.6 64-bit integer atomics on typed UAVs accessed through
+/// `ResourceDescriptorHeap` (`OPTIONS9::AtomicInt64OnTypedResourceSupported` and
+/// `OPTIONS11::AtomicInt64OnDescriptorHeapResourceSupported`).
+pub fn int64_typed_atomic_for_device(device: &ID3D12Device) -> bool {
+    let mut o9 = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
+    let mut o11 = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
+    unsafe {
+        device
+            .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS9, &mut o9 as *mut _ as _, std::mem::size_of_val(&o9) as u32)
+            .is_ok()
+            && o9.AtomicInt64OnTypedResourceSupported.as_bool()
+            && device
+                .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS11, &mut o11 as *mut _ as _, std::mem::size_of_val(&o11) as u32)
+                .is_ok()
+            && o11.AtomicInt64OnDescriptorHeapResourceSupported.as_bool()
+    }
+}
+
+/// Whether the active runtime D3D12 device supports 64-bit typed image atomics through
+/// `ResourceDescriptorHeap`. Defaults to `true` when no runtime device exists (CLI / offline).
+pub fn int64_typed_atomic() -> bool {
+    let raw = crate::hle::d3d12x::real::device_raw();
+    if raw.is_null() {
+        return true;
+    }
+    unsafe {
+        let dev: Option<&ID3D12Device> = windows::core::Interface::from_raw_borrowed(&raw);
+        dev.is_none_or(int64_typed_atomic_for_device)
+    }
 }
 
 pub fn wave32_only_for_device(device: &ID3D12Device) -> bool {
@@ -744,18 +781,23 @@ mod shader_cache_tests {
     #[test]
     fn translated_namespace_tracks_every_request_input() {
         let dir = PathBuf::from("cache");
-        let base = translated::file(&dir, 42, b"console", Stage::Compute, 3, 2, false);
+        let base = translated::file(&dir, 42, b"console", Stage::Compute, 3, 2, false, true);
         let paths = [
             base.clone(),
-            translated::file(&dir, 43, b"console", Stage::Compute, 3, 2, false),
-            translated::file(&dir, 42, b"consolf", Stage::Compute, 3, 2, false),
-            translated::file(&dir, 42, b"console", Stage::Vertex, 3, 2, false),
-            translated::file(&dir, 42, b"console", Stage::Compute, 4, 2, false),
-            translated::file(&dir, 42, b"console", Stage::Compute, 3, 3, false),
-            translated::file(&dir, 42, b"console", Stage::Compute, 3, 2, true),
+            translated::file(&dir, 43, b"console", Stage::Compute, 3, 2, false, true),
+            translated::file(&dir, 42, b"consolf", Stage::Compute, 3, 2, false, true),
+            translated::file(&dir, 42, b"console", Stage::Vertex, 3, 2, false, true),
+            translated::file(&dir, 42, b"console", Stage::Compute, 4, 2, false, true),
+            translated::file(&dir, 42, b"console", Stage::Compute, 3, 3, false, true),
+            translated::file(&dir, 42, b"console", Stage::Compute, 3, 2, true, true),
+            translated::file(&dir, 42, b"console", Stage::Compute, 3, 2, false, false),
         ];
         assert_eq!(paths.iter().collect::<std::collections::HashSet<_>>().len(), paths.len());
         assert!(base.starts_with(dir.join("translated").join("v2").join("000000000000002a")));
+        assert!(
+            base.file_name().unwrap().to_str().unwrap().ends_with("_Compute_3_2_0.bin"),
+            "capable-adapter key format must stay unchanged: {base:?}"
+        );
     }
 
     /// A translation on disk comes back for the same bytes and semantic identity only: other
@@ -789,7 +831,7 @@ mod shader_cache_tests {
         translated::store_in(&unnamespaced, ident, blob, &old);
 
         let mut calls = 0;
-        let first = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || {
+        let first = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, true, || {
             calls += 1;
             Ok(compiled(7))
         })
@@ -797,10 +839,42 @@ mod shader_cache_tests {
         assert_eq!(calls, 1);
         assert_eq!(first.dxil[0], 7);
         assert!(unnamespaced.exists());
-        assert!(translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false).exists());
+        assert!(translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false, true).exists());
 
-        let second = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || panic!("v2 entry was not reused")).unwrap();
+        let second = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, true, || panic!("v2 entry was not reused")).unwrap();
         assert_eq!(second.dxil, first.dxil);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn translated_cache_keys_incapable_adapter_separately() {
+        let dir = std::env::temp_dir().join(format!("xcl-translated-noi64a-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let blob = b"console";
+        let ident = 42;
+        let capable = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, true, || Ok(compiled(1))).unwrap();
+        assert_eq!(capable.dxil[0], 1);
+
+        let mut incapable_calls = 0;
+        let incapable = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, false, || {
+            incapable_calls += 1;
+            Ok(compiled(2))
+        })
+        .unwrap();
+        assert_eq!(incapable_calls, 1);
+        assert_eq!(incapable.dxil[0], 2);
+
+        let incapable_again = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, false, || {
+            panic!("incapable-adapter disk entry was not reused")
+        })
+        .unwrap();
+        assert_eq!(incapable_again.dxil, incapable.dxil);
+
+        let capable_again = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, true, || {
+            panic!("capable-adapter disk entry was clobbered")
+        })
+        .unwrap();
+        assert_eq!(capable_again.dxil, capable.dxil);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -811,6 +885,7 @@ mod shader_cache_tests {
             sampler_base: 0,
             windows: 1,
             split_wave64: false,
+            int64_typed_atomic: true,
             cache_dir: "cache".into(),
         }
     }
@@ -867,13 +942,19 @@ mod shader_cache_tests {
                 ..original.clone()
             },
             ShaderKey {
+                int64_typed_atomic: false,
+                ..original.clone()
+            },
+            ShaderKey {
                 cache_dir: "other cache".into(),
                 ..original.clone()
             },
         ] {
-            let b = cached_shader(&cache, changed, b"a", || Ok(compiled(2))).unwrap();
+            let b = cached_shader(&cache, changed.clone(), b"a", || Ok(compiled(2))).unwrap();
             assert!(!Arc::ptr_eq(&a, &b));
             assert_eq!(b.dxil[0], 2);
+            let b_again = cached_shader(&cache, changed, b"a", || panic!("variant entry was not cached")).unwrap();
+            assert!(Arc::ptr_eq(&b, &b_again));
         }
         let b = cached_shader(&cache, original.clone(), b"b", || Ok(compiled(3))).unwrap();
         assert_eq!(b.dxil[0], 3);
