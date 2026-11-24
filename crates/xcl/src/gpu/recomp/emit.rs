@@ -3851,7 +3851,12 @@ impl Em {
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
         self.uses_scratch = true;
         let saddr = f("SADDR");
-        let base = if saddr != 0x7D && saddr != 0x7F { self.sreg(saddr) } else { self.vreg(f("ADDR")) };
+        // GFX10.3: SADDR 0x7D (NULL) is VADDR + offset, 0x7F the offset alone (ST mode)
+        let base = match saddr {
+            0x7F => "0u".to_string(),
+            0x7D => self.vreg(f("ADDR")),
+            _ => self.sreg(saddr),
+        };
         let raw = f("OFFSET") as u32;
         let off = (((raw << 20) as i32) >> 20) as u32;
         let t = self.t();

@@ -4623,6 +4623,46 @@ fn gpu_global_atomics_and_sub_dword_access() {
 /// The instructions added for code outside the retail pack: global inc / dec / csub /
 /// 64-bit add, LDS signed min / max, cmpst, mskor, float add (CAS loops), global sub-dword
 /// and d16 accesses, scratch, SAD / lerp, the division helpers, saturating adds, packs, swap.
+/// Scratch with SADDR 0x7F (ST mode) addresses the offset alone; 0x7D adds VADDR (#1361).
+#[test]
+fn scratch_st_mode_takes_the_offset_alone_hlsl() {
+    let st = encode("SCRATCH_STORE_DWORD", "ENC_FLAT_SCRATCH", &[("ADDR", 0), ("DATA", 1), ("SADDR", 0x7F), ("OFFSET", 16)], None).unwrap();
+    let vaddr = encode("SCRATCH_LOAD_DWORD", "ENC_FLAT_SCRATCH", &[("VDST", 3), ("ADDR", 5), ("SADDR", 0x7D), ("OFFSET", 16)], None).unwrap();
+    let code: Vec<u8> = [st, vaddr, encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap()].concat();
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(t.hlsl.contains("_a = 0u + 0x00000010u;"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("_a = v5 + 0x00000010u;"), "{}", t.hlsl);
+    assert!(!t.hlsl.contains("_a = v0 + "), "{}", t.hlsl);
+}
+
+/// An ST-mode spill and reload hit the same slot whatever v0 holds in between, and a VADDR load
+/// with VADDR 0 reads that slot too (#1361).
+#[test]
+fn gpu_scratch_st_mode_spill_survives_v0() {
+    if !gpu_ready() {
+        return;
+    }
+    let enc = |n: &'static str, e: &'static str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let mut code = Vec::new();
+    code.extend(enc("SCRATCH_STORE_DWORD", "ENC_FLAT_SCRATCH", &[("ADDR", 0), ("DATA", 1), ("SADDR", 0x7F), ("OFFSET", 16)]));
+    code.extend(enc("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V + 2)]));
+    code.extend(enc("SCRATCH_LOAD_DWORD", "ENC_FLAT_SCRATCH", &[("VDST", 3), ("ADDR", 0), ("SADDR", 0x7F), ("OFFSET", 16)]));
+    code.extend(enc("SCRATCH_LOAD_DWORD", "ENC_FLAT_SCRATCH", &[("VDST", 4), ("ADDR", 5), ("SADDR", 0x7D), ("OFFSET", 16)]));
+    code.extend(enc("S_ENDPGM", "ENC_SOPP", &[]));
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = 0x100 + 4 * l as u32;
+        r[1] = 7 + l as u32;
+        r[2] = 0x40;
+        r[5] = 0;
+    }
+    let r = runner::run_code(&code, &st, &[0u32; 16]).unwrap();
+    for (l, v) in r.vgpr.iter().enumerate() {
+        assert_eq!((v[3], v[4]), (7 + l as u32, 7 + l as u32), "lane {l}: ST-mode reload / VADDR load of the same slot");
+    }
+}
+
 #[test]
 fn gpu_more_atomics_sub_dword_scratch_valu() {
     if !gpu_ready() {
@@ -4661,11 +4701,11 @@ fn gpu_more_atomics_sub_dword_scratch_valu() {
     code.extend(glbl("GLOBAL_LOAD_UBYTE_D16_HI", &[("VDST", 61), ("ADDR", 3), ("SADDR", 2), ("OFFSET", 0x100)]));
     code.extend(glbl("GLOBAL_STORE_SHORT_D16_HI", &[("ADDR", 2), ("DATA", 62), ("SADDR", 2), ("OFFSET", 0x100)]));
     code.extend(glbl("GLOBAL_LOAD_USHORT", &[("VDST", 63), ("ADDR", 2), ("SADDR", 2), ("OFFSET", 0x100)]));
-    // scratch (per lane): a dword at 2 · lane + 16, a byte at 2 · lane + 40
-    code.extend(enc("SCRATCH_STORE_DWORD", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 11), ("SADDR", 0x7F), ("OFFSET", 16)]));
-    code.extend(enc("SCRATCH_STORE_BYTE", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 36), ("SADDR", 0x7F), ("OFFSET", 40)]));
-    code.extend(enc("SCRATCH_LOAD_DWORD", "ENC_FLAT_SCRATCH", &[("VDST", 64), ("ADDR", 2), ("SADDR", 0x7F), ("OFFSET", 16)]));
-    code.extend(enc("SCRATCH_LOAD_UBYTE", "ENC_FLAT_SCRATCH", &[("VDST", 65), ("ADDR", 2), ("SADDR", 0x7F), ("OFFSET", 40)]));
+    // scratch (per lane), VADDR + offset (SADDR NULL): a dword at 2 · lane + 16, a byte at 2 · lane + 40
+    code.extend(enc("SCRATCH_STORE_DWORD", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 11), ("SADDR", 0x7D), ("OFFSET", 16)]));
+    code.extend(enc("SCRATCH_STORE_BYTE", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 36), ("SADDR", 0x7D), ("OFFSET", 40)]));
+    code.extend(enc("SCRATCH_LOAD_DWORD", "ENC_FLAT_SCRATCH", &[("VDST", 64), ("ADDR", 2), ("SADDR", 0x7D), ("OFFSET", 16)]));
+    code.extend(enc("SCRATCH_LOAD_UBYTE", "ENC_FLAT_SCRATCH", &[("VDST", 65), ("ADDR", 2), ("SADDR", 0x7D), ("OFFSET", 40)]));
     // VALU
     let vv = |n: u64| V + n;
     code.extend(vop3("V_SAD_U8", &[("VDST", 66), ("SRC0", vv(22)), ("SRC1", vv(23)), ("SRC2", vv(24))]));
