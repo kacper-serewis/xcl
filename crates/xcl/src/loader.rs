@@ -22,6 +22,8 @@ static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 static LOAD_LOCK: Mutex<()> = Mutex::new(());
 thread_local! {
     static IN_LOAD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// While this thread runs a thread notification: its `IN_LOAD` when the notification began.
+    static NOTIFIED_AT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 /// Set once the main image is ready; thread notifications are ignored before that.
 static READY: AtomicBool = AtomicBool::new(false);
@@ -269,16 +271,48 @@ pub fn init_dll(m: &Arc<MappedModule>) -> Result<(), String> {
     Ok(())
 }
 
+/// A thread notification is running on this thread, which holds Windows' loader lock: it must not
+/// wait for `LOAD_LOCK`, whose owner may need Windows' loader lock to finish (a `LoadLibrary` of a
+/// TLS carrier or a system DLL, a thread its DllMain waits for). False in a load the notification
+/// itself began: that one owns `LOAD_LOCK`.
+fn in_notification() -> bool {
+    NOTIFIED_AT.get() == Some(IN_LOAD.get())
+}
+
+struct NotificationGuard(Option<u32>);
+impl NotificationGuard {
+    fn enter() -> NotificationGuard {
+        NotificationGuard(NOTIFIED_AT.replace(Some(IN_LOAD.get())))
+    }
+}
+impl Drop for NotificationGuard {
+    fn drop(&mut self) {
+        NOTIFIED_AT.set(self.0);
+    }
+}
+
 struct LoadGuard;
 impl LoadGuard {
-    fn enter() -> (LoadGuard, Option<std::sync::MutexGuard<'static, ()>>) {
-        let outer = IN_LOAD.with(|c| {
-            let v = c.get();
-            c.set(v + 1);
-            v == 0
-        });
-        let g = if outer { Some(LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner())) } else { None };
-        (LoadGuard, g)
+    /// Err, without waiting, when a thread notification asks while another thread is loading.
+    fn enter() -> Result<(LoadGuard, Option<std::sync::MutexGuard<'static, ()>>), String> {
+        use std::sync::TryLockError;
+        let lock = if IN_LOAD.get() != 0 {
+            None
+        } else if in_notification() {
+            match LOAD_LOCK.try_lock() {
+                Ok(g) => Some(g),
+                Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
+                Err(TryLockError::WouldBlock) => {
+                    return Err("another thread is loading a DLL and a thread notification cannot wait for it".into())
+                }
+            }
+        } else {
+            #[cfg(test)]
+            tests::about_to_wait();
+            Some(LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
+        };
+        IN_LOAD.set(IN_LOAD.get() + 1);
+        Ok((LoadGuard, lock))
     }
 }
 impl Drop for LoadGuard {
@@ -290,8 +324,14 @@ impl Drop for LoadGuard {
 /// Map + initialise a DLL that ships with the game (idempotent).
 pub fn load_game_dll(path: &Path) -> Result<Arc<MappedModule>, String> {
     let key = crate::util::dll_key(&path.to_string_lossy());
-    let (_g, _lock) = LoadGuard::enter();
+    let notification = in_notification();
+    let (_g, _lock) = LoadGuard::enter().map_err(|e| format!("{key}: {e}"))?;
     if let Some(m) = modules::find_mapped_by_name(&key) {
+        // a thread that ends inside the DllMain it is loading: its notifications get no handle
+        // of that DLL (that DllMain itself does)
+        if notification && m.is_dll && !m.initialized.load(Ordering::Acquire) {
+            return Err(format!("{key}: a thread notification asked for it before its DllMain has finished"));
+        }
         return Ok(m);
     }
     let m = map_image(path)?;
@@ -310,7 +350,7 @@ pub fn load_game_dll(path: &Path) -> Result<Arc<MappedModule>, String> {
 
 /// Map the title's main executable.
 pub fn load_main(path: &Path) -> Result<Arc<MappedModule>, String> {
-    let (_g, _lock) = LoadGuard::enter();
+    let (_g, _lock) = LoadGuard::enter()?;
     map_image_ex(path, true)
 }
 
@@ -385,6 +425,7 @@ pub fn run_main(m: &Arc<MappedModule>) -> u32 {
 /// Windows' loader does: a DLL that is still being mapped (by a `LoadLibrary` of the title's
 /// while another thread starts) may not be executable yet, nor set up for its callbacks.
 unsafe fn thread_event(modules: &[Arc<MappedModule>], reason: u32) {
+    let _notification = NotificationGuard::enter();
     let ready = |m: &MappedModule| !m.is_dll || m.initialized.load(Ordering::Acquire);
     let dll_main = |m: &MappedModule| {
         if m.is_dll && m.initialized.load(Ordering::Acquire) && !m.no_thread_calls.load(Ordering::Relaxed) && m.entry_rva != 0 {
@@ -489,6 +530,108 @@ mod tests {
         f
     }
 
+    /// Taken by the tests that load: a notification's load depends on whether `LOAD_LOCK` is free.
+    static SERIAL: Mutex<()> = Mutex::new(());
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// What a thread under test did, in order.
+    #[derive(Debug, PartialEq)]
+    enum Event {
+        /// It is about to block on `LOAD_LOCK`.
+        Wait,
+        /// Its request returned this handle.
+        Got(Option<usize>),
+        Ended,
+    }
+    type Request = Box<dyn Fn() -> Option<usize>>;
+    thread_local! {
+        static EVENTS: std::cell::RefCell<Option<std::sync::mpsc::Sender<Event>>> = const { std::cell::RefCell::new(None) };
+        /// What this thread's notifications ask for.
+        static REQUEST: std::cell::RefCell<Option<Request>> = const { std::cell::RefCell::new(None) };
+    }
+    fn record(e: Event) {
+        EVENTS.with_borrow(|t| {
+            if let Some(t) = t {
+                let _ = t.send(e);
+            }
+        });
+    }
+    /// Called right before a load blocks on `LOAD_LOCK`.
+    pub(super) fn about_to_wait() {
+        record(Event::Wait);
+    }
+    fn request() {
+        let h = REQUEST.with_borrow(|r| r.as_ref().and_then(|r| r()));
+        record(Event::Got(h));
+    }
+    unsafe extern "system" fn asking_callback(_base: *mut c_void, _reason: u32, _r: *mut c_void) {
+        request();
+    }
+    unsafe extern "system" fn asking_dll_main(_base: *mut c_void, _reason: u32, _r: *mut c_void) -> i32 {
+        request();
+        1
+    }
+
+    /// Runs `body` on a thread of its own, recording its events. A notification in it is a call of
+    /// `thread_event`: Windows' loader lock is not held, so a wait that should not be is recorded
+    /// instead of being a deadlock.
+    fn recorded(body: impl FnOnce() + Send + 'static) -> std::sync::mpsc::Receiver<Event> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            EVENTS.set(Some(tx));
+            body();
+            record(Event::Ended);
+        });
+        rx
+    }
+    /// The thread's next event (the limit only keeps a broken loader from hanging the suite).
+    fn next(rx: &std::sync::mpsc::Receiver<Event>) -> Event {
+        rx.recv_timeout(std::time::Duration::from_secs(30)).expect("the thread recorded nothing")
+    }
+    /// One at a time: a thread that records `Wait` goes no further while the test holds the lock.
+    fn assert_next(rx: &std::sync::mpsc::Receiver<Event>, expected: &[Event]) {
+        for (i, e) in expected.iter().enumerate() {
+            assert_eq!(next(rx), *e, "event {i} of {expected:?}");
+        }
+    }
+
+    /// A module that is only an entry in a notification's list.
+    fn listed_module(is_dll: bool, initialized: bool, dll_main: Option<DllMain>, callbacks: Vec<usize>) -> Arc<MappedModule> {
+        Arc::new(MappedModule {
+            name: "xcl_listed.dll".into(),
+            path: PathBuf::new(),
+            // its entry point, at RVA 1
+            base: dll_main.map_or(0, |f| f as usize - 1),
+            size: 0,
+            entry_rva: dll_main.is_some() as u32,
+            is_dll,
+            exports: Default::default(),
+            tls_callbacks: Mutex::new(callbacks),
+            no_thread_calls: AtomicBool::new(false),
+            initialized: AtomicBool::new(initialized),
+            stack_reserve: 0,
+        })
+    }
+    /// The title's code a notification runs, each making the thread's request: the DllMain of an
+    /// initialised DLL and a TLS callback of the executable.
+    fn asking_modules() -> [Arc<MappedModule>; 2] {
+        [
+            listed_module(true, true, Some(asking_dll_main), Vec::new()),
+            listed_module(false, false, None, vec![asking_callback as usize]),
+        ]
+    }
+
+    /// Code that jumps to `f`.
+    fn jump_to(f: DllMain) -> Vec<u8> {
+        // mov rax, f; jmp rax
+        let mut code = vec![0x48, 0xB8];
+        code.extend_from_slice(&(f as usize as u64).to_le_bytes());
+        code.extend_from_slice(&[0xFF, 0xE0]);
+        code
+    }
+
     fn write(name: &str, bytes: &[u8]) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("xcl-loader-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -507,21 +650,7 @@ mod tests {
         unsafe extern "system" fn callback(_base: *mut c_void, reason: u32, _r: *mut c_void) {
             CALLS.fetch_add(reason, Ordering::Relaxed);
         }
-        let module = |is_dll: bool| {
-            Arc::new(MappedModule {
-                name: "xcl_tls_wait.dll".into(),
-                path: PathBuf::new(),
-                base: 0,
-                size: 0,
-                entry_rva: 0,
-                is_dll,
-                exports: Default::default(),
-                tls_callbacks: Mutex::new(vec![callback as usize]),
-                no_thread_calls: AtomicBool::new(false),
-                initialized: AtomicBool::new(false),
-                stack_reserve: 0,
-            })
-        };
+        let module = |is_dll: bool| listed_module(is_dll, false, None, vec![callback as usize]);
         let dll = module(true);
         unsafe { thread_event(&[dll.clone()], 2) };
         unsafe { thread_event(&[dll.clone()], 3) };
@@ -549,6 +678,7 @@ mod tests {
     /// second load runs DllMain again (before: the second load returned the uninitialised module).
     #[test]
     fn a_dll_whose_dllmain_fails_is_not_loaded() {
+        let _serial = serial();
         // xor eax, eax; ret
         let p = write("xcl_dllmain_false.dll", &tiny_dll(0x7E51_0000_0000, &[0x31, 0xC0, 0xC3], None));
         let key = crate::util::dll_key("xcl_dllmain_false.dll");
@@ -569,6 +699,7 @@ mod tests {
     /// returned the base at once, of a DLL whose pages and DllMain were not done yet).
     #[test]
     fn load_library_waits_for_a_dll_another_thread_is_loading() {
+        let _serial = serial();
         let p = write("xcl_loading_wait.dll", &tiny_dll(0x7E54_0000_0000, &[0xB8, 1, 0, 0, 0, 0xC3], None));
         let lock = LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let m = map_image(&p).unwrap();
@@ -582,11 +713,129 @@ mod tests {
         assert_eq!(h, Some(m.base));
     }
 
+    /// A thread notification runs under Windows' loader lock, which the thread that is loading a
+    /// DLL may need: one that asks for that DLL, or for another that has to be loaded, neither
+    /// waits nor gets an unfinished DLL's handle. The same thread asking outside the notification
+    /// waits, and once the DLL is loaded a notification gets it.
+    #[test]
+    fn a_thread_notification_never_waits_for_nor_gets_an_unfinished_dll() {
+        let _serial = serial();
+        let p = write("xcl_notified.dll", &tiny_dll(0x7E55_0000_0000, &[0xB8, 1, 0, 0, 0, 0xC3], None));
+        let other = write("xcl_notified_other.dll", &tiny_dll(0x7E56_0000_0000, &[0xB8, 1, 0, 0, 0, 0xC3], None));
+        let ask = || resolver::load_library("xcl_notified.dll");
+        let lock = LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let m = map_image(&p).unwrap();
+
+        for reason in [2, 3] {
+            let rx = recorded(move || {
+                REQUEST.set(Some(Box::new(ask)));
+                unsafe { thread_event(&asking_modules(), reason) };
+            });
+            assert_next(&rx, &[Event::Got(None), Event::Got(None), Event::Ended]);
+        }
+        // a DLL nobody has begun to load needs the lock as well
+        let path = other.clone();
+        let rx = recorded(move || {
+            REQUEST.set(Some(Box::new(move || load_game_dll(&path).ok().map(|m| m.base))));
+            unsafe { thread_event(&asking_modules(), 2) };
+        });
+        assert_next(&rx, &[Event::Got(None), Event::Got(None), Event::Ended]);
+        assert!(modules::find_mapped_by_name("xcl_notified_other.dll").is_none());
+
+        // one thread: refused in the notification, waiting after it
+        let rx = recorded(move || {
+            REQUEST.set(Some(Box::new(ask)));
+            unsafe { thread_event(&asking_modules()[..1], 2) };
+            request();
+            unsafe { thread_event(&asking_modules()[..1], 3) };
+        });
+        assert_next(&rx, &[Event::Got(None), Event::Wait]);
+        init_dll(&m).unwrap();
+        drop(lock);
+        let got = || Event::Got(Some(m.base));
+        assert_next(&rx, &[got(), got(), Event::Ended]);
+
+        // the lock is free: a notification loads a DLL itself
+        let rx = recorded(move || {
+            REQUEST.set(Some(Box::new(move || load_game_dll(&other).ok().map(|m| m.base))));
+            unsafe { thread_event(&asking_modules()[..1], 2) };
+        });
+        let got = next(&rx);
+        let loaded = modules::find_mapped_by_name("xcl_notified_other.dll").expect("not loaded");
+        assert!(loaded.initialized.load(Ordering::Acquire));
+        assert_eq!(got, Event::Got(Some(loaded.base)));
+        assert_next(&rx, &[Event::Ended]);
+    }
+
+    /// A DllMain that asks for its own DLL gets it at once, in an ordinary load and in one a thread
+    /// notification began; a notification in the middle of that DllMain does not get it.
+    #[test]
+    fn a_dll_asking_for_itself_while_it_is_loaded_gets_its_handle() {
+        let _serial = serial();
+        const NAME: &str = "xcl_asks_for_itself.dll";
+        unsafe extern "system" fn dll_main(_base: *mut c_void, _reason: u32, _r: *mut c_void) -> i32 {
+            record(Event::Got(resolver::load_library(NAME)));
+            thread_event(&asking_modules()[..1], 3);
+            record(Event::Got(resolver::load_library(NAME)));
+            0
+        }
+        let p = write(NAME, &tiny_dll(0x7E57_0000_0000, &jump_to(dll_main), None));
+        for in_notification in [false, true] {
+            let path = p.clone();
+            let rx = recorded(move || {
+                // the first request loads, the one from the DllMain's notification only asks
+                REQUEST.set(Some(Box::new(move || match IN_LOAD.get() {
+                    0 => load_game_dll(&path).ok().map(|m| m.base),
+                    _ => resolver::load_library(NAME),
+                })));
+                if in_notification {
+                    unsafe { thread_event(&asking_modules()[..1], 2) };
+                } else {
+                    request();
+                }
+                assert_eq!((IN_LOAD.get(), NOTIFIED_AT.get()), (0, None));
+            });
+            if !in_notification {
+                assert_eq!(next(&rx), Event::Wait);
+            }
+            let itself = next(&rx);
+            assert!(matches!(itself, Event::Got(Some(_))), "{itself:?}");
+            assert_eq!(next(&rx), Event::Got(None), "a notification in the middle of the DllMain");
+            assert_eq!(next(&rx), itself);
+            // DllMain returned FALSE: the load is taken back
+            assert_next(&rx, &[Event::Got(None), Event::Ended]);
+            assert!(modules::find_mapped_by_name(NAME).is_none());
+        }
+    }
+
+    /// The load a notification was refused fails: the DLL is not left registered, and the ordinary
+    /// waiter's own attempt fails as well.
+    #[test]
+    fn a_dll_that_fails_after_a_notification_was_refused_is_taken_back() {
+        let _serial = serial();
+        let p = write("xcl_notified_fails.dll", &tiny_dll(0x7E58_0000_0000, &[0x31, 0xC0, 0xC3], None));
+        let lock = LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let m = map_image(&p).unwrap();
+        let rx = recorded(|| {
+            REQUEST.set(Some(Box::new(|| resolver::load_library("xcl_notified_fails.dll"))));
+            unsafe { thread_event(&asking_modules()[..1], 2) };
+            request();
+        });
+        assert_next(&rx, &[Event::Got(None), Event::Wait]);
+        // what load_game_dll does when DllMain fails
+        assert!(init_dll(&m).is_err());
+        modules::unregister_mapped(m.base);
+        drop(lock);
+        assert_next(&rx, &[Event::Got(None), Event::Ended]);
+        assert!(modules::find_mapped_by_name("xcl_notified_fails.dll").is_none());
+    }
+
     /// An import table that does not parse: the load fails and the module – whose memory is
     /// freed – is not found afterwards (before: still registered over freed memory, and a second
     /// load returned it).
     #[test]
     fn a_dll_with_a_broken_import_table_is_not_left_registered() {
+        let _serial = serial();
         // a descriptor at RVA 0x1010 whose name RVA lies outside the image
         let mut code = vec![0xB8, 1, 0, 0, 0, 0xC3];
         code.resize(0x10, 0xCC);
