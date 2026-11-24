@@ -2248,6 +2248,43 @@ fn buffer_words_at(va: u64, format: windows::Win32::Graphics::Dxgi::Common::DXGI
     crate::gpu::desc::buffer_words(va + first * elem as u64, stride, records, fmt)
 }
 
+/// The shader-readable companion for a console image UAV.
+pub(crate) fn uav_read_view(rd: &D3D12_RESOURCE_DESC, view: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    let dim = view.map_or_else(|| resource_dim_to_view(rd), |v| v.ViewDimension.0);
+    let format = view.map_or(rd.Format, |v| v.Format);
+    let mut srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: if format.0 == 0 { rd.Format } else { format },
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        ..Default::default()
+    };
+    match D3D12_UAV_DIMENSION(dim) {
+        D3D12_UAV_DIMENSION_TEXTURE2D => {
+            let mip = view.map_or(0, |v| unsafe { v.Anonymous.Texture2D.MipSlice });
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MostDetailedMip: mip, MipLevels: 1, ..Default::default() };
+        }
+        D3D12_UAV_DIMENSION_TEXTURE2DARRAY if !rd.Flags.contains(D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) => {
+            // D3D permits R32 UAVs on these other typeless families. The cast is UAV-only.
+            if matches!(format, DXGI_FORMAT_R32_FLOAT | DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R32_SINT)
+                && matches!(rd.Format, DXGI_FORMAT_R10G10B10A2_TYPELESS | DXGI_FORMAT_R8G8B8A8_TYPELESS |
+                    DXGI_FORMAT_B8G8R8A8_TYPELESS | DXGI_FORMAT_B8G8R8X8_TYPELESS | DXGI_FORMAT_R16G16_TYPELESS)
+            {
+                return None;
+            }
+            let array = view.map_or_else(|| D3D12_TEX2D_ARRAY_UAV { ArraySize: rd.DepthOrArraySize.into(), ..Default::default() }, |v| unsafe { v.Anonymous.Texture2DArray });
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            srv.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV {
+                MostDetailedMip: array.MipSlice, MipLevels: 1,
+                FirstArraySlice: array.FirstArraySlice, ArraySize: array.ArraySize,
+                PlaneSlice: array.PlaneSlice, ResourceMinLODClamp: 0.0,
+            };
+        }
+        _ => return None,
+    }
+    Some(pc_srv(rd, Some(&srv)).unwrap_or(srv))
+}
+
 unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, cpu: u64) {
     // the view's format as the PC's for the resource (B5G5R5A1 of a target made R8G8B8A8,
     // `device_x::pc_resource_desc`: an invalid call, the device removed)
@@ -2316,22 +2353,117 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
         return super::console_heap::write(&slot, &[0; 8]);
     };
     // RDNA images have no SRV / UAV distinction: console shaders may read this slot too
-    if dim == 4 {
-        let mut srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: if format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN { rd.Format } else { format },
-            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_SINT, DXGI_FORMAT_R32_UINT};
+    let companion = uav_read_view(&rd, desc.as_ref()).filter(|srv| {
+        // The PC depth resource has no UAV. Only bind its readable depth/stencil formats.
+        !no_uav || srv.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2DARRAY ||
+            matches!((rd.Format.0, srv.Format.0), (19, 21 | 22) | (44, 46 | 47) | (39, 41..=43) | (53, 54 | 56..=59))
+    }).map(|srv| (res, srv)).or_else(|| {
+        // Replace any previous array SRV even when this resource cannot back the read view.
+        (D3D12_UAV_DIMENSION(dim) == D3D12_UAV_DIMENSION_TEXTURE2DARRAY).then(|| (std::ptr::null_mut(), D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: match format {
+                DXGI_FORMAT_R32_FLOAT | DXGI_FORMAT_R32_SINT => format,
+                _ => DXGI_FORMAT_R32_UINT,
+            },
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: mip, MipLevels: 1, PlaneSlice: 0, ResourceMinLODClamp: 0.0 } },
-        };
-        if let Some(v) = pc_srv(&rd, Some(&srv)) {
-            srv = v;
-        }
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                MipLevels: 1, ArraySize: 1, ..Default::default()
+            } },
+        }))
+    });
+    if let Some((read_resource, srv)) = companion {
         let g: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
-        g(this, res, &srv, slot.pc_srv);
+        g(this, read_resource, &srv, slot.pc_srv);
         super::console_heap::publish(&slot, false);
     }
     let (w, h) = ((w >> mip).max(1), (h >> mip).max(1));
     super::console_heap::write(&slot, &crate::gpu::desc::xcl_image_for_view(slot.index, fmt, ty, w, h, d, 1));
+}
+
+#[cfg(test)]
+#[test]
+fn array_uav_replaces_registered_read_slot() {
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    use super::console_heap;
+
+    #[repr(C)]
+    struct Resource {
+        vt: *const usize,
+        desc: D3D12_RESOURCE_DESC,
+    }
+    unsafe extern "system" fn get_desc(this: *mut c_void, out: *mut D3D12_RESOURCE_DESC) {
+        *out = (*this.cast::<Resource>()).desc;
+    }
+
+    #[repr(C)]
+    struct Device {
+        vt: *const usize,
+        srv: Vec<(usize, D3D12_SHADER_RESOURCE_VIEW_DESC, u64)>,
+        uav: Vec<(usize, D3D12_UNORDERED_ACCESS_VIEW_DESC, u64)>,
+    }
+    unsafe extern "system" fn srv(this: *mut c_void, res: *mut c_void, desc: *const D3D12_SHADER_RESOURCE_VIEW_DESC, at: u64) {
+        (*this.cast::<Device>()).srv.push((res as usize, *desc, at));
+    }
+    unsafe extern "system" fn uav(this: *mut c_void, res: *mut c_void, _: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, at: u64) {
+        (*this.cast::<Device>()).uav.push((res as usize, *desc, at));
+    }
+
+    let mut original = [0usize; 20];
+    original[18] = srv as usize;
+    original[19] = uav as usize;
+    let ext = [original.as_ptr() as usize, 0];
+    let mut device = Device { vt: ext[1..].as_ptr(), srv: vec![], uav: vec![] };
+    let mut vt = [0usize; 11];
+    vt[10] = get_desc as usize;
+    let mut resource = Resource { vt: vt.as_ptr(), desc: D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 8, Height: 4, DepthOrArraySize: 4,
+        MipLevels: 2, Format: DXGI_FORMAT_R8G8B8A8_TYPELESS, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, ..Default::default()
+    }};
+    let res = (&raw mut resource).cast();
+    let dev = (&raw mut device).cast();
+    let heap = dev as usize;
+    assert!(console_heap::register(heap, 2, 0x1000, 0, 32, false, false, false));
+    let cpu = console_heap::start(heap).unwrap() + console_heap::SLOT as u64;
+    let array = D3D12_TEX2D_ARRAY_UAV { MipSlice: 1, FirstArraySlice: 1, ArraySize: 2, PlaneSlice: 0 };
+    for format in [DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_UINT] {
+        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: format, ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture2DArray: array } };
+        unsafe { dev_create_uav_x(dev, res, std::ptr::null_mut(), &desc, cpu) };
+    }
+    let shadow = unsafe { *(cpu as *const [u32; 8]) };
+    resource.desc.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
+    resource.desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    let res = (&raw mut resource).cast();
+    for format in [DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_FLOAT] {
+        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: format, ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture2DArray: array } };
+        unsafe { dev_create_uav_x(dev, res, std::ptr::null_mut(), &desc, cpu) };
+    }
+    console_heap::unregister(heap);
+    assert_eq!(shadow, crate::gpu::desc::xcl_image_for_view(2, crate::gpu::desc::gfx10_format(DXGI_FORMAT_R32_UINT).unwrap(),
+        crate::gpu::desc::ImageType::D2Array, 4, 2, 2, 1));
+    assert_eq!(device.uav.len(), 4);
+    assert!(device.uav[2..].iter().all(|call| call.0 == 0 && call.2 == 0x1060));
+    for ((resource, desc, at), format) in device.uav.iter().zip([DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_UINT]) {
+        assert_eq!((*resource, *at, desc.Format, desc.ViewDimension), (res as usize, 0x1060, format, D3D12_UAV_DIMENSION_TEXTURE2DARRAY));
+        let a = unsafe { desc.Anonymous.Texture2DArray };
+        assert_eq!((a.MipSlice, a.FirstArraySlice, a.ArraySize, a.PlaneSlice), (1, 1, 2, 0));
+    }
+    assert_eq!(device.srv.len(), 4);
+    assert_eq!((device.srv[2].0, device.srv[2].1.Format, device.srv[2].2), (0, DXGI_FORMAT_R32_UINT, 0x1040));
+    assert_eq!((device.srv[3].0, device.srv[3].1.Format, device.srv[3].2), (res as usize, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, 0x1040));
+    let (first, desc, at) = device.srv[0];
+    assert_eq!((first, at, desc.Format, desc.ViewDimension), (res as usize, 0x1040, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_SRV_DIMENSION_TEXTURE2DARRAY));
+    let a = unsafe { desc.Anonymous.Texture2DArray };
+    assert_eq!((a.MostDetailedMip, a.MipLevels, a.FirstArraySlice, a.ArraySize, a.PlaneSlice), (1, 1, 1, 2, 0));
+    let (second, desc, at) = device.srv[1];
+    assert_eq!(second, 0, "the R32 UAV cast requires a null companion SRV");
+    assert_eq!((at, desc.Format, desc.ViewDimension, desc.Shader4ComponentMapping),
+        (0x1040, DXGI_FORMAT_R32_UINT, D3D12_SRV_DIMENSION_TEXTURE2DARRAY, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING));
+    let a = unsafe { desc.Anonymous.Texture2DArray };
+    assert_eq!((a.MipLevels, a.ArraySize), (1, 1));
 }
 
 /// device #127 (a retail game): CreateCommittedResource with a barrier layout in the initial state's place

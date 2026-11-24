@@ -789,7 +789,7 @@ pub fn draw_on(
 }
 
 /// A texture in D3D12 terms (e.g. decoded from a console T# by `gpu::desc`): SRV at
-/// descriptor heap index 2·i; `data` = the `MipLevels` levels one after the other, each in
+/// descriptor heap index 2·i; `data` = each slice's mip levels in D3D12 subresource order, each in
 /// tightly packed rows (`row_bytes` for level 0, its width's share for the smaller ones).
 pub struct ViewTexture {
     pub res: D3D12_RESOURCE_DESC,
@@ -832,16 +832,18 @@ unsafe fn bind_views(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, textu
     let mut keep: Vec<windows::core::IUnknown> = vec![heap.cast().map_err(e)?, sheap.cast().map_err(e)?];
     for (i, t) in textures.iter().enumerate() {
         let levels = t.res.MipLevels.max(1) as usize;
-        let mut fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); levels];
-        let (mut rows, mut total) = (vec![0u32; levels], 0u64);
-        dev.GetCopyableFootprints(&t.res, 0, levels as u32, 0, Some(fps.as_mut_ptr()), Some(rows.as_mut_ptr()), None, Some(&mut total));
+        let slices = if t.res.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { 1 } else { t.res.DepthOrArraySize as usize };
+        let subresources = levels * slices;
+        let mut fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); subresources];
+        let (mut rows, mut total) = (vec![0u32; subresources], 0u64);
+        dev.GetCopyableFootprints(&t.res, 0, subresources as u32, 0, Some(fps.as_mut_ptr()), Some(rows.as_mut_ptr()), None, Some(&mut total));
         let up = buffer(dev, total, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)?;
         let mut p = std::ptr::null_mut();
         up.Map(0, None, Some(&mut p)).map_err(e)?;
         let texel = t.row_bytes / (t.res.Width as usize).max(1);
         let mut offset = 0usize;
         for (k, fp) in fps.iter().enumerate() {
-            let row_bytes = ((t.res.Width as usize) >> k).max(1) * texel;
+            let row_bytes = ((t.res.Width as usize) >> (k % levels)).max(1) * texel;
             for y in 0..rows[k] as usize {
                 if let Some(src) = t.data.get(offset + y * row_bytes..offset + (y + 1) * row_bytes) {
                     std::ptr::copy_nonoverlapping(src.as_ptr(), (p as *mut u8).add(fp.Offset as usize + y * fp.Footprint.RowPitch as usize), row_bytes);

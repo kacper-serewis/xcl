@@ -2114,6 +2114,60 @@ fn draw_console_views(
     runner::draw_views(&vsb, &psb, &layout, &verts, 24, sgprs, &[], textures, samplers, 16, [-1.0; 4]).unwrap()
 }
 
+/// A reused descriptor slot already has a full-array SRV. A UAV of mip 1,
+/// layers 1 and 2 must replace that readable view for RDNA image operations.
+#[test]
+fn gpu_array_uav_read_view() {
+    if !gpu_ready() {
+        return;
+    }
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_FLOAT, DXGI_SAMPLE_DESC};
+    let res = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 8, Height: 4,
+        DepthOrArraySize: 4, MipLevels: 2, Format: DXGI_FORMAT_R32_FLOAT,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, ..Default::default()
+    };
+    let previous = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: res.Format, ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2DArray: D3D12_TEX2D_ARRAY_SRV { MipLevels: 2, ArraySize: 4, ..Default::default() } },
+    };
+    let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: res.Format, ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture2DArray: D3D12_TEX2D_ARRAY_UAV { MipSlice: 1, FirstArraySlice: 1, ArraySize: 2, PlaneSlice: 0 } },
+    };
+    let srv = crate::hle::d3d12x::real::uav_read_view(&res, Some(&uav)).unwrap_or(previous);
+    let mut data = Vec::new();
+    for layer in 0..4 {
+        for mip in 0..2 {
+            for y in 0..(4 >> mip) {
+                for x in 0..(8 >> mip) {
+                    data.extend_from_slice(&((1000 * layer + 100 * mip + 10 * y + x) as f32).to_le_bytes());
+                }
+            }
+        }
+    }
+    let tex = runner::ViewTexture { res, srv, data, row_bytes: 8 * 4 };
+    let ps = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 129)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 129)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 129)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("IMAGE_LOAD", "ENC_MIMG", &[("VDATA", 8), ("VADDR", 4), ("SRSRC", 4), ("DMASK", 1), ("DIM", 5)], None),
+        ("IMAGE_GET_RESINFO", "ENC_MIMG", &[("VDATA", 12), ("VADDR", 7), ("SRSRC", 4), ("DMASK", 7), ("DIM", 5)], None),
+        ("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 12), ("SRC0", 268)], None),
+        ("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 13), ("SRC0", 269)], None),
+        ("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 14), ("SRC0", 270)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 15), ("VSRC0", 12), ("VSRC1", 13), ("VSRC2", 14), ("VSRC3", 8), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    let mut sgprs = vec![0; 32];
+    sgprs[16..24].copy_from_slice(&tsharp(0, 22, 13));
+    let px = draw_console_views(None, Some(&ps), &[[0.0, 0.0], [0.0, 32.0], [32.0, 0.0]], &sgprs, &[tex], &[]);
+    assert_eq!(px[0], [4.0, 2.0, 2.0, 2111.0]);
+}
+
 /// `image_sample_o` in a pixel shader, implicit LOD between two mips (trilinear): the console
 /// moves each mip's texel coordinate by the offset in that mip's texels. A 4-level texture
 /// (8², 4², 2², 1²; level k texel x holds 100·k + x), point min / mag, linear mip, clamp;
