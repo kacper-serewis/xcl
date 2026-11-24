@@ -564,6 +564,24 @@ mod tests {
         assert_eq!(load_game_dll(&p).unwrap().base, m.base);
     }
 
+    /// LoadLibrary of a game DLL another thread is still loading – registered, its DllMain not
+    /// run yet – waits for that load to finish, as Windows' loader lock makes it (before: it
+    /// returned the base at once, of a DLL whose pages and DllMain were not done yet).
+    #[test]
+    fn load_library_waits_for_a_dll_another_thread_is_loading() {
+        let p = write("xcl_loading_wait.dll", &tiny_dll(0x7E54_0000_0000, &[0xB8, 1, 0, 0, 0, 0xC3], None));
+        let lock = LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let m = map_image(&p).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(resolver::load_library("xcl_loading_wait.dll")).unwrap());
+        let early = rx.recv_timeout(std::time::Duration::from_millis(300));
+        assert!(early.is_err(), "LoadLibrary returned {early:?} before the DLL was initialised");
+        init_dll(&m).unwrap();
+        drop(lock);
+        let h = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("LoadLibrary still waiting");
+        assert_eq!(h, Some(m.base));
+    }
+
     /// An import table that does not parse: the load fails and the module – whose memory is
     /// freed – is not found afterwards (before: still registered over freed memory, and a second
     /// load returned it).

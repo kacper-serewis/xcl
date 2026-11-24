@@ -387,7 +387,19 @@ pub fn load_library(name: &str) -> Option<usize> {
         None => {}
     }
     if let Some(m) = modules::find_mapped_by_name(&key) {
-        return Some(m.base);
+        if !m.is_dll || m.initialized.load(std::sync::atomic::Ordering::Acquire) {
+            return Some(m.base);
+        }
+        // registered but its load not finished (imports, page protections, DllMain): wait for
+        // it under the loader's lock, as Windows' loader lock does – NULL if its DllMain failed.
+        // On the thread that is loading it the loader is re-entrant and returns it at once.
+        return match crate::loader::load_game_dll(&m.path) {
+            Ok(m) => Some(m.base),
+            Err(e) => {
+                crate::xlog_error!("LoadLibrary({name}): {e}");
+                None
+            }
+        };
     }
     let candidate = crate::vfs::get()
         .and_then(|v| v.real_path_for_read(name))
