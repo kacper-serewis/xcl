@@ -18,6 +18,7 @@
 //!            +0x18 zlib stream → FSSM
 //! FSSM       +0 "FSSM"  +4 u32 version (0x101)  +8 u32 size of everything after the 16-B header
 //!            +0xC0 u64 code offset, +0xC8 u64 code size (offsets relative to +0x10)
+//!            +0xD4 u32 flags: bit 5 = the code is for 32-lane waves (wave32)
 //!            +0x100 hardware-stage descriptor u64 0x000000C0_0002_AAHH
 //!                   (HH = PAL hardware stage, AA = API stage; one more every 0x88 B,
 //!                   e.g. GS + its VS copy shader); unused fields are 0xDEADBEEF.
@@ -141,6 +142,16 @@ impl Fssm {
             Some((o, l)) => &self.data[o..o + l],
             None => &[],
         }
+    }
+
+    /// The header says the code is for 32-lane waves: bit 5 of the flags word at +0xD4
+    /// (measured on a retail pack: set for every program with 32-bit EXEC writes only, clear
+    /// for every one with 64-bit ones). An unused field (0xDEADBEEF) says nothing, nor does a
+    /// word that is not known to be header: the header's code pointer must check out, and the
+    /// code start behind the word.
+    pub fn wave32(&self) -> bool {
+        let in_header = self.code_from_header && self.code.is_some_and(|(start, _)| start >= 0xD8);
+        self.version == 0x101 && in_header && rd32(&self.data, 0xD4).is_some_and(|w| w != 0xDEAD_BEEF && w & 0x20 != 0)
     }
 
     pub fn stage_label(&self) -> String {
@@ -797,6 +808,76 @@ pub(crate) mod tests {
         let f = &sh.fssm[0];
         assert!(!f.code_from_header);
         assert!(f.programs.iter().any(|p| p.offset == 0x308), "{:?}", f.programs);
+    }
+
+    /// A wave32 program without an EXEC write (nothing in its code tells the wave size) is
+    /// wave32 by its header; a clear flag, an unused field or another version leaves it to
+    /// the code.
+    #[test]
+    fn wave_size_comes_from_the_header_flag() {
+        let wave64 = |version: u32, flags: u32| {
+            let mut f = fssm(&CODE, &[(6, 5)]);
+            f[4..8].copy_from_slice(&version.to_le_bytes());
+            f[0xD4..0xD8].copy_from_slice(&flags.to_le_bytes());
+            let sh = parse(&sample(5, &[f])).unwrap();
+            let f = &sh.fssm[0];
+            let p = &f.programs[0];
+            (f.wave32(), crate::gpu::recomp::fssm_wave64(f, &f.data[p.offset..p.offset + p.len]))
+        };
+        assert!(crate::gpu::recomp::detect_wave64(&CODE), "the code alone reads as wave64");
+        assert_eq!(wave64(0x101, 0x20), (true, false));
+        assert_eq!(wave64(0x101, 0x1F | 0x40), (false, true));
+        assert_eq!(wave64(0x101, 0), (false, true));
+        assert_eq!(wave64(0x101, 0xDEAD_BEEF), (false, true));
+        assert_eq!(wave64(0x100, 0x20), (false, true));
+    }
+
+    /// The flags word at +0xD4 counts only inside the header: where code covers those bytes,
+    /// their bit 5 is an instruction's, and code found by scanning leaves the layout unknown.
+    #[test]
+    fn wave_size_flag_must_lie_inside_the_header() {
+        const ENDPGM: u32 = 0xBF81_0000;
+        const S_MOV: u32 = 0xBE80_0301; // s_mov_b32 s0, s1
+        const BIT5: u32 = 0xBE80_0321; // s_mov_b32 s0, s33: bit 5 set, as in a wave32 header
+        // version 0x101, `code` at `at` (+0xC0 points there unless `scanned`)
+        let build = |at: usize, code: &[u32], flags: Option<u32>, scanned: bool| {
+            let mut f = fssm(&[], &[]);
+            f.truncate(at);
+            let pointer = if scanned { 0xFFFF_FFFF } else { at as u64 - 0x10 };
+            f[0xC0..0xC8].copy_from_slice(&pointer.to_le_bytes());
+            f[0xC8..0xD0].copy_from_slice(&(code.len() as u64 * 4).to_le_bytes());
+            if let Some(w) = flags {
+                f[0xD4..0xD8].copy_from_slice(&w.to_le_bytes());
+            }
+            code.iter().for_each(|&w| le32(&mut f, w));
+            let size = f.len() as u32 - 0x10;
+            f[8..12].copy_from_slice(&size.to_le_bytes());
+            let f = parse(&sample(5, &[f])).unwrap().fssm.remove(0);
+            let p = f.programs[0];
+            let wave64 = crate::gpu::recomp::fssm_wave64(&f, &f.data[p.offset..p.offset + p.len]);
+            (f.code_from_header, f.code.unwrap().0, f.wave32(), wave64)
+        };
+        let code = &[S_MOV, S_MOV, ENDPGM][..];
+        let mut bad = Vec::new();
+        for (what, at, code, flags, scanned, want) in [
+            ("the word is the code's second instruction", 0xD0, &[S_MOV, BIT5, ENDPGM][..], None, false, (true, 0xD0, false, true)),
+            ("the word is the code's first instruction", 0xD4, &[BIT5, ENDPGM][..], None, false, (true, 0xD4, false, true)),
+            ("the header ends behind the word", 0xD8, code, Some(0x20), false, (true, 0xD8, true, false)),
+            ("the header ends behind the word, bit 5 clear", 0xD8, code, Some(0xDF), false, (true, 0xD8, false, true)),
+            ("retail layout", 0x308, code, Some(0x20), false, (true, 0x308, true, false)),
+            ("scanned code behind the word", 0x308, code, Some(0x20), true, (false, 0x308, false, true)),
+        ] {
+            let got = build(at, code, flags, scanned);
+            if got != want {
+                bad.push(format!("{what}: {got:x?}, want {want:x?}"));
+            }
+        }
+        let (from_header, at, wave32, _) = build(0xD0, &[S_MOV, BIT5, ENDPGM], None, true);
+        assert!(!from_header && at <= 0xD4, "scanned code at {at:#x}");
+        if wave32 {
+            bad.push("scanned code over the word: wave32".into());
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
     }
 
     #[test]

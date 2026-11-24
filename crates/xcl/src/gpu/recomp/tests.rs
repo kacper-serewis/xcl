@@ -31,6 +31,16 @@ fn wave64_hardware() -> bool {
     w
 }
 
+/// 32-lane hardware waves (a wave32 program, or the split wave64 form).
+fn wave32_hardware() -> bool {
+    let w = runner::wave32_supported() == Ok(true);
+    if !w {
+        println!("no 32-lane waves on this GPU – skipping");
+        runner::skip_test("no wave32");
+    }
+    w
+}
+
 /// `o` for a program run on this adapter (the split wave64 form where it is needed).
 fn on_gpu(o: Options) -> Options {
     Options { split_wave64: runner::split_for(&o.mode), ..o }
@@ -8068,4 +8078,112 @@ fn jumps_to_outer_loop_heads_are_structured() {
     }
     println!("{structured} of 120 programs structured ({entered} jumps into a loop), {ran} run both ways");
     assert!(structured >= 100 && entered > 20, "{structured} structured, {entered} jumps into loops");
+}
+
+/// A wave32 program that never writes EXEC by name looks like wave64 in its code; its FSSM
+/// header says wave32. In the wave64 form its compares write a register pair, over the
+/// register the program keeps next to the mask, and its lane reads span 64 threads. Checked
+/// against a wave model written here (nothing of the emitter).
+#[test]
+fn gpu_fssm_wave32_flag_decides_masks_and_lane_reads() {
+    if gpu_ready() && wave32_hardware() {
+        // the wave64 form that runs here, so a misread flag shows as wrong lanes
+        fssm_waves_match_the_model(0x20, 32, runner::split_wave64());
+    }
+}
+
+/// The control with the flag clear in 64-lane waves; needs no 32-lane ones.
+#[test]
+fn gpu_fssm_clear_wave32_flag_in_native_wave64() {
+    if gpu_ready() && wave64_hardware() {
+        fssm_waves_match_the_model(0, 64, false);
+    }
+}
+
+/// The control with the flag clear in the split form, on any adapter with 32-lane waves.
+#[test]
+fn gpu_fssm_clear_wave32_flag_in_split_wave64() {
+    if gpu_ready() && wave32_hardware() {
+        fssm_waves_match_the_model(0, 64, true);
+    }
+}
+
+/// The programs of the tests above from an FSSM with `flags` at +0xD4, checked against the
+/// model for waves of `lanes`.
+fn fssm_waves_match_the_model(flags: u32, lanes: u32, split: bool) {
+    use crate::gpu::xbox::tests::{fssm, sample};
+    // user SGPRs s0 / s1, thread ids v0 (x) and v1 (y)
+    let run = |code: &[u8], size: [u32; 3], words: usize| {
+        let mut h = fssm(code, &[(6, 3)]);
+        let rsrc2 = 2u32 << 1 | 1 << 11;
+        for (at, v) in [(0xD4, flags), (0x138, rsrc2), (0x13C, size[0]), (0x140, size[1]), (0x144, size[2])] {
+            h[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let c = super::pso::console_to_dxil_in(&sample(5, &[h]), super::pso::Stage::Compute, 0, split, 1).unwrap();
+        runner::dispatch(&c.dxil, [1, 1, 1], &[0; 128], &vec![0xDEAD_BEEF; words]).unwrap()
+    };
+    let code = prog(&[
+        ("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 0), ("SRC0", V + 1), ("SRC1", 131), ("SRC2", V)], None), // thread = 8 y + x
+        // thread >= 3 ? thread - 3 : thread, the 3 in s5, next to the mask in s4
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 5), ("SSRC0", 131)], None),
+        ("V_CMP_LE_U32", "ENC_VOP3", &[("VDST", 4), ("SRC0", 5), ("SRC1", V)], None),
+        ("V_SUBREV_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 5), ("VSRC1", 0)], None),
+        ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", V + 4), ("SRC2", 4)], None),
+        // EXEC = threads 6..39; a wave without any of them skips the rest
+        ("V_CMPX_LT_U32", "ENC_VOPC", &[("SRC0", 133), ("VSRC1", 0)], None),
+        ("V_CMPX_GT_U32", "ENC_VOPC", &[("SRC0", 168), ("VSRC1", 0)], None),
+        ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 10)], None), // → s_endpgm
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", V)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 9), ("SRC0", V), ("SRC1", 129)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 8)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 9)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 5)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 8), ("SRC0", 132), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORDX4", "ENC_FLAT_GLBL", &[("ADDR", 8), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ]);
+    assert!(super::detect_wave64(&code), "nothing in the code says wave32");
+    let model = |threads: u32| {
+        let mut out = vec![0xDEAD_BEEFu32; threads as usize * 4];
+        for base in (0..threads).step_by(lanes as usize) {
+            let wave = base..(base + lanes).min(threads);
+            let mask = wave.clone().filter(|&t| 3 <= t).fold(0u64, |m, t| m | 1 << (t - base));
+            // wave32: the compare writes s4 alone; wave64: s4 and s5
+            let s5 = if lanes == 64 { (mask >> 32) as u32 } else { 3 };
+            let active: Vec<u32> = wave.filter(|t| (6..40).contains(t)).collect();
+            for &t in &active {
+                let picked = if mask >> (t - base) & 1 == 1 { t.wrapping_sub(s5) } else { t };
+                out[t as usize * 4..][..4].copy_from_slice(&[picked, active[0], base + 1, s5]);
+            }
+        }
+        out
+    };
+    let mut bad = Vec::new();
+    for size in [[8u32, 1, 1], [32, 1, 1], [40, 1, 1], [64, 1, 1], [8, 8, 1], [128, 1, 1]] {
+        let threads: u32 = size.iter().product();
+        let (got, want) = (run(&code, size, threads as usize * 4), model(threads));
+        let wrong: Vec<usize> = (0..want.len()).filter(|&i| got[i] != want[i]).collect();
+        if let Some(&i) = wrong.first() {
+            bad.push(format!("group {size:?}, flags {flags:#x}: {} of {} words, first thread {} word {}: {:#x}, want {:#x}", wrong.len(), want.len(), i / 4, i % 4, got[i], want[i]));
+        }
+    }
+    // LDS across waves behind a barrier: the same with either wave size
+    for threads in [64u32, 128] {
+        let code = prog(&[
+            ("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", 129), ("SRC2", V)], None),
+            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 8), ("SRC0", 130), ("VSRC1", 0)], None),
+            ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 8), ("DATA0", 4)], None),
+            ("S_BARRIER", "ENC_SOPP", &[], None),
+            ("V_SUB_NC_U32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 255), ("VSRC1", 0)], Some(threads - 1)),
+            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 6)], None),
+            ("DS_READ_B32", "ENC_DS", &[("ADDR", 6), ("VDST", 7)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 128)], None),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 8), ("DATA", 7), ("SADDR", 0x7D)], None),
+        ]);
+        let want: Vec<u32> = (0..threads).map(|t| 3 * (threads - 1 - t)).collect();
+        if run(&code, [threads, 1, 1], threads as usize) != want {
+            bad.push(format!("LDS, {threads} threads, flags {flags:#x}"));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
 }

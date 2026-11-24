@@ -370,6 +370,13 @@ pub fn wave64_supported() -> Result<bool, String> {
     gpu.as_ref().map(|x| x.wave64).map_err(|x| x.clone())
 }
 
+/// Whether the adapter runs 32-lane waves (`[WaveSize(32)]`); false on a wave64-only one.
+pub fn wave32_supported() -> Result<bool, String> {
+    let mut g = GPU.lock().unwrap();
+    let gpu = g.get_or_insert_with(init);
+    gpu.as_ref().map(|x| x.wave32).map_err(|x| x.clone())
+}
+
 /// Whether wave64 programs need the split form here (`Options::split_wave64`): the
 /// adapter runs only 32-lane waves. False without a usable GPU.
 pub fn split_wave64() -> bool {
@@ -439,7 +446,7 @@ pub fn mesh_shaders_supported() -> Result<bool, String> {
 }
 
 /// A GPU test (or a part of one) that cannot run here, `reason` one of "no GPU", "no DXC",
-/// "no wave64", "no mesh shaders": `SKIPPED <test>: <reason>` written to stderr itself, so the
+/// "no wave64", "no wave32", "no mesh shaders": `SKIPPED <test>: <reason>` written to stderr itself, so the
 /// line shows without `--nocapture` (libtest captures only `print!` / `eprint!`), and
 /// `scripts/test.ps1` counts them. `XCL_REQUIRE_GPU=wave64` or `=mesh` (or both, comma-separated)
 /// turns a skip that leaves that coverage out into a failure.
@@ -449,8 +456,8 @@ pub fn skip_test(reason: &str) {
     let test = thread.name().unwrap_or("?");
     let required = std::env::var("XCL_REQUIRE_GPU").unwrap_or_default();
     let fails = required.split(',').map(str::trim).any(|r| match r {
-        "wave64" => reason != "no mesh shaders",
-        "mesh" => reason != "no wave64",
+        "wave64" => !matches!(reason, "no mesh shaders" | "no wave32"),
+        "mesh" => !matches!(reason, "no wave64" | "no wave32"),
         _ => false,
     });
     if fails {
