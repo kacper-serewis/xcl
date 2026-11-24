@@ -1,0 +1,13 @@
+# Rendering integration
+
+Base `9e3831e1f570d3646e53ab753b19ec07eb8f1485`. The supplied 1.0.2.1 pack translated 26,698/26,698 programs, with eight successful DXC sample compiles. Run the named PR regression tests against the base implementation first and check that Cargo selects at least one test. Paths below are relative to `crates/xcl/src/`.
+
+- [ ] Restore UAV clears through console handles. PR #1291, `hle/d3d12x/{list_x,real}.rs`. Run `cargo test -p xcl --lib clear_uav_with_console_handles_clears_the_slots_view` and verify the cleared word by readback.
+- [ ] Bound generated HLSL size for crossing forward jumps. PR #1345, `gpu/recomp/{mod,tests}.rs`. Run `cargo test -p xcl --lib crossing_forward_jumps_guard_in_linear_size` and compare GPU outputs and source size.
+- [ ] Preserve 1D-array layer counts in image dimension queries. PR #1266, `gpu/recomp/{emit,runner,tests}.rs`. Run `cargo test -p xcl --lib image_get_resinfo_1d_array` and verify width 4 and layers 3.
+- [ ] Preserve 64-bit image atomic results. Competing PRs #1533 and #1551, `gpu/recomp/{emit,tests}.rs`. Run `cargo test -p xcl --lib gpu_image_atomics_64_bit` from #1533 and check both halves.
+- [ ] Correct ES-to-GS control flow at S_SETPC_B64. Competing PRs #1375 and #1528, `gpu/recomp/mod.rs`. Run `cargo test -p xcl --lib multi_block_es_gs_treats_s_setpc_as_terminator_and_tracks_handoff_edge` from #1528.
+- [ ] Correct scratch addressing in immediate-only mode. Competing PRs #1365 and #1377, `gpu/recomp/{emit,tests}.rs`. Run `cargo test -p xcl --lib scratch_address_modes_st_vaddr_and_saddr` from #1377.
+- [ ] Validate packed texture element sizes. PR #1165, `gpu/desc.rs`. Run `cargo test -p xcl --lib format_bytes_covers_packed_16bit_and_32bit_formats` and verify byte strides.
+- [ ] Measure contiguous CPU detile copies. PR #1512, `gpu/tiling.rs`. Run `cargo test -p xcl --lib detile_level_runs_match_elements` and compare timings on identical inputs with byte-for-byte equality.
+- [x] Align the memory-query test buffer. PR #656 at `d3e0b22`, integration `519c7c5`, `hle/kernelx.rs`. The focused test `xmem_virtual_query_marks_cpu_readable_memory` went from one failure to one pass. Full workspace 776 passed, 0 failed, 41 ignored, including three explicit skips.
