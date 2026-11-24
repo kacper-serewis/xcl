@@ -8562,6 +8562,143 @@ fn a_padded_group_barrier_counts_its_padding_waves() {
     }
 }
 
+/// Padding a group leaves the program the LDS words it has without (`XCL_X_LDS_TOP` /
+/// `XCL_LDS_TOP`: the accesses above it are clamped to it). Split wave64 runs a group of 32
+/// threads or fewer, padded, as two hardware waves: `s_barrier` takes the bounded form, whose
+/// two words came out of the program's (its top word went from 8184 to 8182, and 8182..8184
+/// were one word). Its state is in the thread counter's word there; every other group keeps
+/// its two words.
+#[test]
+fn a_padded_group_keeps_its_lds_words() {
+    if std::env::var_os("XCL_SAFE_BARRIER").is_some() {
+        return;
+    }
+    let write = ins("DS_WRITE_B32", "ENC_DS", &[("ADDR", 0), ("DATA0", 1)], None);
+    let barrier = ins("S_BARRIER", "ENC_SOPP", &[], None);
+    // an exchange of one word, or of 32 (ds_bpermute)
+    let wide = ins("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 2), ("ADDR", 0), ("DATA0", 1)], None);
+    let programs = [(1, vec![write.clone()]), (1, vec![write.clone(), barrier.clone()]), (32, vec![wide, write, barrier])];
+    let number = |h: &str, define: &str| -> Option<u32> { h.split(&format!("#define {define} ")).nth(1)?.split('u').next()?.parse().ok() };
+    let lds_word = |h: &str, define: &str| -> Option<u32> { h.split(&format!("#define {define} xcl_lds[")).nth(1)?.split('u').next()?.parse().ok() };
+    for (threads, wave64, split) in (1..=128).chain([1000]).flat_map(|n| [(n, true, true), (n, true, false), (n, false, false)]) {
+        let lanes = if wave64 { 64 } else { 32 };
+        for (slot, parts) in &programs {
+            let what = format!("{threads} threads, wave{lanes}, split {split}, exchange of {slot}");
+            let code = program_of(parts);
+            let hlsl = |pad_waves: PadWaves| {
+                let mode = Mode::Compute(cs_of([threads, 1, 1], false));
+                let t = translate(&code, &Options { mode, wave64, split_wave64: split, pad_waves, ..Default::default() }).unwrap();
+                assert!(t.complete(), "{what}: {:?}", t.unsupported_why);
+                t.hlsl
+            };
+            let (h, never) = (hlsl(PadWaves::Always), hlsl(PadWaves::Never));
+            assert_eq!(h == never, threads % lanes == 0, "{what}");
+            for top in ["XCL_X_LDS_TOP", "XCL_LDS_TOP"] {
+                assert_eq!(number(&h, top), number(&never, top), "{what}: {top} with and without the padding");
+            }
+            // the bounded barrier, whenever the group has several hardware waves …
+            let hw_waves = threads.next_multiple_of(lanes).div_ceil(if split { 32 } else { lanes });
+            let bounded = parts.len() > 1 && hw_waves > 1;
+            assert_eq!(h.matches("xcl_s_barrier();").count(), bounded as usize, "{what}");
+            assert_eq!(h.contains("void xcl_s_barrier()"), bounded, "{what}");
+            // … in one word only where the group has no barrier words without the padding
+            let one_word = bounded && split && threads <= 32;
+            assert_eq!(h.contains("#define XCL_BAR XCL_XW\n"), one_word, "{what}");
+            assert_eq!(h.contains("#define XCL_BAR_STATE xcl_lds[8190u]\n"), bounded && !one_word, "{what}");
+            if !one_word {
+                continue;
+            }
+            // the runtime's words follow the program's and end with the block
+            let top = number(&h, "XCL_X_LDS_TOP").unwrap();
+            let at = ["XCL_XS(i)", "XCL_XC(i)", "XCL_XW"].map(|m| lds_word(&h, m).unwrap());
+            assert_eq!(at, [top + 1, top + 1 + 4 * slot, top + 3 + 4 * slot], "{what}");
+            assert_eq!(at[2], 8191, "{what}");
+            // the counter only hands out the threads, which is over (a group sync) when the
+            // barrier's state takes its word
+            assert_eq!(h.split("uint xcl_x_thread(uint gi)").nth(1).unwrap().matches("XCL_XW").count(), 2 + 1, "{what}: xcl_x_thread and XCL_BAR");
+            assert!(h.contains("void xcl_s_barrier_init(uint gi) {\n    GroupMemoryBarrierWithGroupSync();"), "{what}");
+            let order = ["    uint xcl_tid = xcl_x_thread(gi);\n", "    xcl_s_barrier_init(gi);\n", "    gi = xcl_tid;"].map(|l| h.find(l).unwrap());
+            assert!(order.is_sorted(), "{what}: {order:?}");
+        }
+    }
+}
+
+/// The LDS of a padded group of 20 threads on the GPU. Each thread stores to its own word of
+/// 8165..8184 – the last words the group has without the padding – and after `s_barrier`
+/// reads its own word and thread 19 - t's: before, 8182..8184 were one word. The program
+/// turns on all 64 lanes of its wave, which must still be there: their count, and two rounds
+/// of each lane storing a word that lane 63 - l (the other half's) reads after `s_barrier`:
+/// words 0..63, then 64..127 = what it read + 1. All stores are to disjoint words.
+#[test]
+fn gpu_padded_group_keeps_its_top_lds_words() {
+    if !gpu_ready() {
+        return;
+    }
+    let vop2 = |n: &str, d: u64, s0: u64, s1: u64| ins(n, "ENC_VOP2", &[("VDST", d), ("SRC0", s0), ("VSRC1", s1)], None);
+    let lit = |d: u64, l: u32, s1: u64| ins("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", d), ("SRC0", 255), ("VSRC1", s1)], Some(l));
+    let write = |a: u64, d: u64| ins("DS_WRITE_B32", "ENC_DS", &[("ADDR", a), ("DATA0", d)], None);
+    let read = |d: u64, a: u64| ins("DS_READ_B32", "ENC_DS", &[("VDST", d), ("ADDR", a)], None);
+    let code = program_of(&[
+        // all 64 lanes: v10 = lane, LDS[lane] = 0x900 + lane, s20 = how many they are
+        ins("S_OR_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 30), ("SSRC0", 193)], None),
+        ins("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", 193), ("SRC1", 128)], None),
+        ins("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", 193), ("SRC1", V + 10)], None),
+        vop2("V_LSHLREV_B32", 11, 130, 10),
+        lit(12, 0x900, 10),
+        write(11, 12),
+        ins("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", V), ("VSRC1", 0)], None),
+        ins("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 20), ("SSRC0", 106)], None),
+        ins("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 30)], None),
+        // the launched threads: LDS[8165 + t] = 0x500 + t
+        vop2("V_LSHLREV_B32", 13, 130, 0),
+        lit(13, 8165 * 4, 13),
+        lit(14, 0x500, 0),
+        write(13, 14),
+        ins("S_BARRIER", "ENC_SOPP", &[], None),
+        // v24..v26: the count, its own word, thread 19 - t's
+        ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 24), ("SRC0", 20)], None),
+        read(25, 13),
+        vop2("V_SUB_NC_U32", 15, 128 + 19, 0),
+        vop2("V_LSHLREV_B32", 15, 130, 15),
+        lit(15, 8165 * 4, 15),
+        read(26, 15),
+        // all 64 lanes again: LDS[64 + lane] = the word of lane 63 - lane, + 1; the next round: v27
+        ins("S_OR_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 30), ("SSRC0", 193)], None),
+        vop2("V_SUB_NC_U32", 16, 128 + 63, 10),
+        vop2("V_LSHLREV_B32", 16, 130, 16),
+        read(17, 16),
+        vop2("V_ADD_NC_U32", 17, 129, 17),
+        lit(18, 64 * 4, 11),
+        write(18, 17),
+        ins("S_BARRIER", "ENC_SOPP", &[], None),
+        lit(19, 64 * 4, 16),
+        read(27, 19),
+        ins("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 30)], None),
+        vop2("V_LSHLREV_B32", 30, 132, 0),
+        vop2("V_ADD_NC_U32", 30, 0, 30),
+        ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 31), ("SRC0", 128)], None),
+        ins("GLOBAL_STORE_DWORDX4", "ENC_FLAT_GLBL", &[("ADDR", 30), ("DATA", 24), ("SADDR", 0x7D)], None),
+    ]);
+    let base = 0x100usize;
+    let run = |pad_waves: PadWaves| -> Vec<[u32; 4]> {
+        let t = translate(&code, &on_gpu(Options { mode: Mode::Compute(cs_of([20, 1, 1], false)), wave64: true, pad_waves, ..Default::default() })).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        let out = runner::dispatch(&dxil, [1, 1, 1], &[base as u32, 20, 20], &vec![0u32; base / 4 + 20 * 4]).unwrap();
+        out[base / 4..base / 4 + 20 * 4].chunks(4).map(|c| c.try_into().unwrap()).collect()
+    };
+    // without the padding: the same words, 20 lanes (the words of the others are not stored)
+    for (t, got) in (0u32..).zip(run(PadWaves::Never)) {
+        assert_eq!(got[..3], [20, 0x500 + t, 0x500 + 19 - t], "thread {t}, not padded");
+    }
+    let bad: Vec<String> = (0u32..)
+        .zip(run(PadWaves::WhereSeen))
+        .filter(|(t, got)| *got != [64, 0x500 + t, 0x500 + 19 - t, 0x901 + t])
+        .map(|(t, got)| format!("thread {t}: {got:x?}"))
+        .collect();
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
 /// What a program sees of its group when the group is padded to whole waves is what it sees
 /// otherwise: thread ids (1-D, 2-D and 3-D groups), the group id, TG_SIZE, its lane and the
 /// launched lanes of its wave, LDS shared across the group around `s_barrier`, and memory –

@@ -4280,6 +4280,15 @@ impl Em {
         self.x64() && (self.uses_lds || matches!(self.opt.mode, Mode::Geometry(_)))
     }
 
+    /// The bounded barrier's state is one word, the thread counter's (`PRELUDE_SAFE_BARRIER_1`):
+    /// a split wave64 group with LDS that has several hardware waves only by its padding – 32
+    /// threads or fewer, padded to 64. Without the padding it has no barrier words, and two
+    /// more at the top of the LDS would be two the program loses.
+    fn one_word_barrier(&self) -> bool {
+        let one_hw_wave = matches!(&self.opt.mode, Mode::Compute(cs) if cs.threads.iter().product::<u32>() <= 32);
+        self.safe_barrier && self.cs_pad && one_hw_wave && self.x64_lds()
+    }
+
     /// Storage and functions of the split wave64 form (`PRELUDE_X64`).
     fn x64_prelude(&self, h: &mut String) {
         let threads = self.x64_threads();
@@ -4293,7 +4302,7 @@ impl Em {
             // the D3D12 limit (32 KB) is the whole block already: the exchange (and optional
             // safe-barrier words at 8189..8190) takes its top, the program's LDS accesses stop
             // below it (`XCL_X_LDS_TOP`)
-            let bar_words = if self.safe_barrier { 2 } else { 0 };
+            let bar_words = if self.safe_barrier && !self.one_word_barrier() { 2 } else { 0 };
             let base = 8192 - slots - counters - 1 - bar_words;
             h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB); the top holds the wave64 exchange\n");
             let _ = writeln!(h, "#define XCL_X_LDS_TOP {}u", base - 1);
@@ -4308,6 +4317,11 @@ impl Em {
     /// Storage and functions for early-exit-safe, bounded `s_barrier` (`PRELUDE_SAFE_BARRIER`).
     fn safe_barrier_prelude(&self, h: &mut String) {
         if !self.safe_barrier {
+            return;
+        }
+        if self.one_word_barrier() {
+            h.push_str("#define XCL_BAR XCL_XW\n");
+            h.push_str(PRELUDE_SAFE_BARRIER_1);
             return;
         }
         if self.x64_lds() {
@@ -4501,12 +4515,16 @@ impl Em {
                     h,
                     "[WaveSize({hw_lanes})]\n[numthreads({nx}, {ny}, {nz})]\nvoid main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)\n{{"
                 );
-                if self.safe_barrier {
+                if self.safe_barrier && !self.one_word_barrier() {
                     h.push_str("    xcl_s_barrier_init(gi);\n");
                 }
                 if self.x64() {
                     // the console thread's ids (`xcl_x_thread`), not this hardware thread's
                     self.x64_entry(&mut h);
+                    if self.one_word_barrier() {
+                        // after `xcl_x_thread`, whose counter it replaces
+                        h.push_str("    xcl_s_barrier_init(gi);\n");
+                    }
                     let _ = writeln!(h, "    gtid = uint3(xcl_tid % {x}u, (xcl_tid / {x}u) % {y}u, xcl_tid / {}u);\n    gi = xcl_tid;", x * y);
                 } else if reorder {
                     let t = padded.unwrap_or(x * y * z);
@@ -5662,6 +5680,60 @@ void xcl_s_barrier() {
                 uint _orig;
                 InterlockedAdd(XCL_BAR_ALIVE, 0xFFFFFFFFu, _orig);
                 InterlockedCompareExchange(XCL_BAR_STATE, _s, _next, _orig);
+                break;
+            }
+        }
+    }
+    if (WaveReadLaneFirst(_ok) == 0u) xcl_bar_alive = false;
+    GroupMemoryBarrier();
+}
+"#;
+
+/// `PRELUDE_SAFE_BARRIER` with its state in one word (`Em::one_word_barrier`: two hardware
+/// waves), step by step the same: `(alive: 6 bits, signed; gen: 20 bits; arrived: 6 bits)`.
+/// The word is the counter of `xcl_x_thread`, which the first group sync ends the use of.
+const PRELUDE_SAFE_BARRIER_1: &str = r#"
+static bool xcl_bar_alive = true;
+void xcl_s_barrier_init(uint gi) {
+    GroupMemoryBarrierWithGroupSync();
+    if (gi == 0u) XCL_BAR = 0u;
+    GroupMemoryBarrierWithGroupSync();
+    if (WaveIsFirstLane()) { uint _o; InterlockedAdd(XCL_BAR, 1u << 26, _o); }
+    GroupMemoryBarrierWithGroupSync();
+}
+void xcl_s_barrier_exit() {
+    if (xcl_bar_alive) {
+        xcl_bar_alive = false;
+        uint _act = WaveActiveCountBits(true);
+        if (WaveIsFirstLane() && _act != 0u) {
+            uint _o;
+            InterlockedAdd(XCL_BAR, 0xFC000000u, _o);
+        }
+    }
+}
+void xcl_s_barrier() {
+    if (!xcl_bar_alive) { GroupMemoryBarrier(); return; }
+    GroupMemoryBarrier();
+    uint _lanes = WaveActiveCountBits(true);
+    uint _ok = 1u;
+    if (WaveIsFirstLane() && _lanes != 0u) {
+        uint _old;
+        InterlockedAdd(XCL_BAR, 1u, _old);
+        uint _gen = (_old >> 6) & 0xFFFFFu;
+        [loop] for (uint _n = 0u; ; _n++) {
+            uint _s, _orig;
+            InterlockedAdd(XCL_BAR, 0u, _s);
+            if (((_s >> 6) & 0xFFFFFu) != _gen) break;
+            int _alive = (int)_s >> 26;
+            uint _next = (_s & 0xFC000000u) | (((_gen + 1u) & 0xFFFFFu) << 6);
+            if (_alive <= 0 || (int)(_s & 63u) >= _alive) {
+                InterlockedCompareExchange(XCL_BAR, _s, _next, _orig);
+                if (_orig == _s) break;
+            }
+            if (_n >= (1u << 20)) {
+                _ok = 0u;
+                InterlockedAdd(XCL_BAR, 0xFC000000u, _orig);
+                InterlockedCompareExchange(XCL_BAR, _s + 0xFC000000u, _next + 0xFC000000u, _orig);
                 break;
             }
         }
