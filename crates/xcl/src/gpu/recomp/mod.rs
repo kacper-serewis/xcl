@@ -583,6 +583,7 @@ fn term(c: &Ctx, start: u64, end: u64) -> Term {
         (Some(t), "S_BRANCH" | "S_SETPC_B64") => Term::Jump(t),
         (Some(_), _) => Term::Other,
         (None, "S_ENDPGM") => Term::End,
+        (None, "S_SETPC_B64") => Term::Other,
         (None, _) if d.inst.flags & rdna2::F_TERMINATOR != 0 => Term::Other,
         _ => Term::Next,
     }
@@ -1465,7 +1466,17 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         // (optimising one big dispatcher loop took minutes on large retail programs).
         let leaders: Vec<u64> = leaders.into_iter().filter(|l| starts.contains(l)).collect();
         let loops = loop_ranges(&insts);
-        let edges: Vec<(u64, u64)> = insts.iter().filter_map(|d| rdna2::branch_target(d).map(|t| (d.pc, t))).collect();
+        let mut edges: Vec<(u64, u64)> = insts.iter().filter_map(|d| rdna2::branch_target(d).map(|t| (d.pc, t))).collect();
+        if let Some(t) = gs_jump.flatten().filter(|t| starts.contains(t)) {
+            for d in &insts {
+                if d.inst.name == "S_SETPC_B64" && d.far_target.is_none() {
+                    edges.push((d.pc, t));
+                }
+            }
+            if opt.split_wave64 && opt.wave64 {
+                edges.push((u64::MAX, t));
+            }
+        }
         let ctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &loops, edges: &edges, memo: Default::default() };
         let mut flags = BTreeSet::new();
         let mut code = String::new();
@@ -1568,5 +1579,134 @@ mod attribute_tests {
         assert_eq!(vs_output_table(&f), Some(vec![0, 1, 2]));
         f[0x1D4 + 8] = 7;
         assert_eq!(vs_output_table(&f), None);
+    }
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+    use crate::gpu::rdna2::encode;
+
+    fn e(n: &str, enc: &str, f: &[(&str, u64)]) -> Vec<u8> {
+        encode(n, enc, f, None).unwrap()
+    }
+
+    fn check_structured_fallthrough(inst: Vec<u8>, ignored: &str) {
+        let mut code = e("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)]);
+        code.extend(inst);
+        code.extend(e("S_ENDPGM", "ENC_SOPP", &[]));
+        let t = translate(&code, &Options::default()).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        assert_eq!(t.ignored.get(ignored), Some(&1));
+        assert!(!t.hlsl.contains("if (pc =="), "{ignored} forced a dispatcher");
+    }
+
+    fn geometry(gs_start: u64) -> GsInterface {
+        let sig = |name: &str, sv: u32, reg: u32| SigElement {
+            name: name.into(),
+            index: 0,
+            system_value: sv,
+            component_type: 3,
+            register: reg,
+            mask: 0xF,
+            rw_mask: 0xF,
+            stream: 0,
+        };
+        GsInterface {
+            es_inputs: vec![],
+            es_outputs: vec![sig("SV_Position", 1, 0)],
+            outputs: vec![sig("SV_Position", 1, 0)],
+            max_vertex_count: 3,
+            gs_start: Some(gs_start),
+        }
+    }
+
+    #[test]
+    fn split_entry_keeps_gs_block_without_indirect_jump() {
+        // The direct branch comes from inside the candidate span. Only the split GS
+        // phase enters it from outside, so it needs a separate guard at gs_start.
+        let mut code = e("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)]);
+        code.extend(e("S_NOP", "ENC_SOPP", &[]));
+        let gs_start = code.len() as u64;
+        code.extend(e("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)]));
+        code.extend(e("S_NOP", "ENC_SOPP", &[]));
+        code.extend(e("S_ENDPGM", "ENC_SOPP", &[]));
+        let t = translate(&code, &Options { mode: Mode::Geometry(geometry(gs_start)), wave64: true, split_wave64: true, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        assert!(t.hlsl.contains(&format!("uint xcl_entry_pc = {gs_start}u;")));
+        assert!(t.hlsl.contains(&format!("if (pc == {gs_start}u)")), "GS phase enters an unguarded block");
+    }
+
+    #[test]
+    fn fetch_call_falls_through() {
+        check_structured_fallthrough(e("S_SWAPPC_B64", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 6)]), "s_swappc_b64 (fetch shader)");
+    }
+
+    #[test]
+    fn code_end_falls_through() {
+        check_structured_fallthrough(e("S_CODE_END", "ENC_SOPP", &[]), "s_code_end");
+    }
+
+    #[test]
+    fn multi_block_es_gs_treats_s_setpc_as_terminator_and_tracks_handoff_edge() {
+        // Multi-block ES: conditional branch around an S_SETPC_B64 handoff into GS, followed by a
+        // second ES block ending in S_SETPC_B64.
+        let mut es = Vec::new();
+        es.extend(e("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)]));
+        es.extend(e("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 2)])); // skip next 2 dwords -> second ES block
+        let first_arm = es.len() as u64;
+        es.extend(e("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 129)]));
+        let first_setpc_pc = es.len() as u64;
+        es.extend(e("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 6)]));
+        let second_arm = es.len() as u64;
+        es.extend(e("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 130)]));
+        es.extend(e("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 6)]));
+
+        // Unreachable ES tail. A structured span starting here could swallow the GS entry.
+        es.extend(e("S_NOP", "ENC_SOPP", &[]));
+        let gs_start = es.len() as u64;
+        // Multi-block GS: conditional branch around a move, then GS done + S_ENDPGM.
+        let mut gs = Vec::new();
+        gs.extend(e("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 1), ("SSRC1", 128)]));
+        gs.extend(e("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)]));
+        gs.extend(e("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 131)]));
+        gs.extend(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x3)]));
+        gs.extend(e("S_ENDPGM", "ENC_SOPP", &[]));
+
+        let mut code = es;
+        code.extend_from_slice(&gs);
+
+        // Verify term() directly classifies untargeted S_SETPC_B64 as Term::Other.
+        let mut insts = Vec::new();
+        let mut off = 0usize;
+        while off + 4 <= code.len() {
+            let d = rdna2::decode(&code[off..], off as u64).unwrap();
+            off += d.len;
+            insts.push(d);
+        }
+        let starts: BTreeSet<u64> = insts.iter().map(|d| d.pc).collect();
+        let ctx = Ctx { insts: &insts, starts: &starts, leaders: &[], loops: &[], edges: &[], memo: Default::default() };
+        assert_eq!(term(&ctx, first_setpc_pc, first_setpc_pc + 4), Term::Other);
+
+        let g = geometry(gs_start);
+        for split_wave64 in [false, true] {
+            let t = translate(&code, &Options { mode: Mode::Geometry(g.clone()), wave64: true, split_wave64, ..Default::default() }).unwrap();
+            assert!(t.complete(), "split={split_wave64}: {:?}", t.unsupported_why);
+            assert!(t.hlsl.contains(&format!("if (pc == {gs_start}u)")), "split={split_wave64}: missing GS entry block\n{}", t.hlsl);
+            let handoff = if split_wave64 {
+                format!("pc = select(xcl_es_phase, 0xFFFFFFFFu, {gs_start}u);")
+            } else {
+                format!("pc = {gs_start}u;")
+            };
+            for start in [first_arm, second_arm] {
+                let guard = format!("if (pc == {start}u) {{");
+                let (_, body) = t.hlsl.split_once(&guard).expect("missing ES arm");
+                let (body, _) = body.split_once("if (pc ==").unwrap();
+                assert!(body.contains(&handoff), "split={split_wave64}: ES arm at {start} lost its handoff");
+            }
+            if dxc::location().is_ok() {
+                dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|err| panic!("split={split_wave64}: {err}\n{}", t.hlsl));
+            }
+        }
     }
 }
