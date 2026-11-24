@@ -939,12 +939,14 @@ unsafe extern "system" fn hk_replace_file_w(replaced: *const u16, replacement: *
 type FnFindFirstExW = unsafe extern "system" fn(*const u16, i32, *mut c_void, i32, *const c_void, u32) -> HANDLE;
 type FnFindFirstW = unsafe extern "system" fn(*const u16, *mut WIN32_FIND_DATAW) -> HANDLE;
 type FnFindFirstA = unsafe extern "system" fn(*const u8, *mut WIN32_FIND_DATAA) -> HANDLE;
+type FnFindFirstExA = unsafe extern "system" fn(*const u8, i32, *mut c_void, i32, *const c_void, u32) -> HANDLE;
 type FnFindNextW = unsafe extern "system" fn(HANDLE, *mut WIN32_FIND_DATAW) -> i32;
 type FnFindNextA = unsafe extern "system" fn(HANDLE, *mut WIN32_FIND_DATAA) -> i32;
 type FnFindClose = unsafe extern "system" fn(HANDLE) -> i32;
 static O_FIND_FIRST_EX_W: AtomicUsize = AtomicUsize::new(0);
 static O_FIND_FIRST_W: AtomicUsize = AtomicUsize::new(0);
 static O_FIND_FIRST_A: AtomicUsize = AtomicUsize::new(0);
+static O_FIND_FIRST_EX_A: AtomicUsize = AtomicUsize::new(0);
 static O_FIND_NEXT_W: AtomicUsize = AtomicUsize::new(0);
 static O_FIND_NEXT_A: AtomicUsize = AtomicUsize::new(0);
 static O_FIND_CLOSE: AtomicUsize = AtomicUsize::new(0);
@@ -1125,6 +1127,29 @@ unsafe extern "system" fn hk_find_first_a(n: *const u8, data: *mut WIN32_FIND_DA
     }
 }
 
+/// Windows' FindFirstFileExA calls neither FindFirstFileExW nor FindFirstFileA (Wine's does).
+unsafe extern "system" fn hk_find_first_ex_a(n: *const u8, lvl: i32, data: *mut c_void, op: i32, filt: *const c_void, fl: u32) -> HANDLE {
+    let orig = orig!(O_FIND_FIRST_EX_A as FnFindFirstExA);
+    // the same info levels/ops as hk_find_first_ex_w
+    if lvl > 1 || op > 1 {
+        return orig(n, lvl, data, op, filt, fl);
+    }
+    let Some(_g) = Guard::enter() else { return orig(n, lvl, data, op, filt, fl) };
+    let Some(path) = from_ansi_ptr(n) else { return orig(n, lvl, data, op, filt, fl) };
+    let mut w: WIN32_FIND_DATAW = std::mem::zeroed();
+    match find_first_vfs(&path, &mut w) {
+        None => orig(n, lvl, data, op, filt, fl),
+        Some(Ok(h)) => {
+            w_to_a(&w, data as *mut WIN32_FIND_DATAA);
+            h
+        }
+        Some(Err(e)) => {
+            SetLastError(e);
+            INVALID_HANDLE_VALUE
+        }
+    }
+}
+
 unsafe fn merged_next(h: HANDLE) -> Option<WIN32_FIND_DATAW> {
     let m = &mut *(h as *mut MergedFind);
     let r = m.items.get(m.pos).copied();
@@ -1207,6 +1232,7 @@ pub fn install() -> Result<(), String> {
         ("FindFirstFileExW", hk_find_first_ex_w as usize, &O_FIND_FIRST_EX_W),
         ("FindFirstFileW", hk_find_first_w as usize, &O_FIND_FIRST_W),
         ("FindFirstFileA", hk_find_first_a as usize, &O_FIND_FIRST_A),
+        ("FindFirstFileExA", hk_find_first_ex_a as usize, &O_FIND_FIRST_EX_A),
         ("FindNextFileW", hk_find_next_w as usize, &O_FIND_NEXT_W),
         ("FindNextFileA", hk_find_next_a as usize, &O_FIND_NEXT_A),
         ("FindClose", hk_find_close as usize, &O_FIND_CLOSE),
