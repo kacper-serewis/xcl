@@ -377,9 +377,10 @@ pub unsafe fn xma_info(fmt: *const WaveFormatEx) -> XmaInfo {
     i
 }
 
-/// PCM16 format with the channel count and sample rate of a voice.
+/// PCM16 format with the channel count and sample rate of a voice (up to
+/// XAUDIO2_MAX_AUDIO_CHANNELS: Windows takes a plain WAVEFORMATEX of 64 channels).
 pub fn pcm16_for_rate(channels: u16, rate: u32) -> WaveFormatEx {
-    let ch = channels.clamp(1, 8);
+    let ch = channels.clamp(1, 64);
     let block = ch * 2;
     WaveFormatEx {
         tag: WAVE_FORMAT_PCM,
@@ -873,6 +874,8 @@ unsafe extern "system" fn create_source_voice(
         match cfg_res.and_then(xma2::Decoder::new) {
             Ok(dec) => {
                 let pcm_ch = dec.channels();
+                // silence for an undecodable buffer is sized by `info`: the voice's channels, not xma_info's 8
+                let info = XmaInfo { channels: pcm_ch, ..info };
                 let pcm_rate = dec.sample_rate();
                 let label = if tag == WAVE_FORMAT_XMA2 { "XMA2" } else { "XMA" };
                 let hr = create_decoded_voice(
@@ -1255,6 +1258,70 @@ mod tests {
         w.cb_size = 0;
         assert_eq!(unsafe { xma_info(&w) }.samples_encoded, 0);
         assert!(is_xma(0x166) && is_xma(0x165) && !is_xma(1));
+    }
+
+    #[test]
+    fn pcm16_keeps_up_to_64_channels() {
+        // XMA2 decodes up to 16 channels; Windows XAudio2 takes plain PCM16 voices of up to
+        // XAUDIO2_MAX_AUDIO_CHANNELS (64).
+        let p = pcm16_for_rate(10, 48_000);
+        assert_eq!((p.channels, p.block_align, p.avg_bytes), (10, 20, 960_000));
+        assert_eq!((pcm16_for_rate(16, 48_000).channels, pcm16_for_rate(16, 48_000).block_align), (16, 32));
+        assert_eq!({ pcm16_for_rate(65, 48_000).channels }, 64);
+        assert_eq!({ pcm16_for_rate(0, 48_000).channels }, 1);
+    }
+
+    #[test]
+    fn xma_voice_keeps_the_decoders_ten_channels() {
+        unsafe {
+            let mut eng: *mut c_void = std::ptr::null_mut();
+            assert_eq!(XAudio2Create(&mut eng, 0, 1), S_OK);
+            let vt_eng = vtable(eng);
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(vt_eng.add(2).read());
+            let create_master: CreateMasteringVoiceFn = std::mem::transmute(vt_eng.add(ENGINE_CREATE_MASTERING_VOICE).read());
+            let mut master: *mut c_void = std::ptr::null_mut();
+            if create_master(eng, &mut master, 0, 0, 0, std::ptr::null(), std::ptr::null(), AUDIO_CATEGORY_GAME_EFFECTS) < 0 {
+                release(eng);
+                eprintln!("skipping: no audio device");
+                return;
+            }
+            let create_src: CreateSourceVoiceFn = std::mem::transmute(vt_eng.add(ENGINE_CREATE_SOURCE_VOICE).read());
+            let mut xma_fmt = xma2(10, 48_000, 6080, 2048, 1);
+            xma_fmt.num_streams = 5;
+            let mut voice: *mut c_void = std::ptr::null_mut();
+            let fmt = &xma_fmt as *const Xma2WaveFormatEx as *const WaveFormatEx;
+            assert_eq!(create_src(eng, &mut voice, fmt, 0, 2.0, std::ptr::null_mut(), std::ptr::null(), std::ptr::null()), S_OK);
+            let vt_v = vtable(voice);
+
+            // IXAudio2Voice::GetVoiceDetails (slot 0): InputChannels is the PCM16 voice's channel count
+            let details: unsafe extern "system" fn(*mut c_void, *mut [u32; 4]) = std::mem::transmute(vt_v.read());
+            let mut d = [0u32; 4];
+            details(voice, &mut d);
+            assert_eq!(d[2], 10, "PCM16 voice channels of a 10-channel XMA2 voice");
+
+            // a buffer that does not decode becomes silence in 10-channel frames
+            let bad_pkt = vec![0x5Au8; xma2::PACKET_SIZE];
+            let b = XAudio2Buffer {
+                flags: XAUDIO2_END_OF_STREAM,
+                audio_bytes: bad_pkt.len() as u32,
+                audio_data: bad_pkt.as_ptr(),
+                play_begin: 0,
+                play_length: 480,
+                loop_begin: 0,
+                loop_length: 0,
+                loop_count: 0,
+                context: std::ptr::null_mut(),
+            };
+            let submit: SubmitSourceBufferFn = std::mem::transmute(vt_v.add(VOICE_SUBMIT_SOURCE_BUFFER).read());
+            let hr = submit(voice, &b, std::ptr::null());
+            assert_eq!(hr, S_OK, "SubmitSourceBuffer(undecodable XMA2) → {:#x}", hr as u32);
+
+            let destroy: DestroyVoiceFn = std::mem::transmute(vt_v.add(VOICE_DESTROY).read());
+            destroy(voice);
+            let destroy_master: DestroyVoiceFn = std::mem::transmute(vtable(master).add(VOICE_DESTROY).read());
+            destroy_master(master);
+            release(eng);
+        }
     }
 
     #[test]
