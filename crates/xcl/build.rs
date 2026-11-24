@@ -14,6 +14,7 @@ const TRANSLATOR_SOURCES: &[&str] = &[
     "src/gpu/recomp/emit.rs",
     "src/gpu/recomp/mesh_wave.rs",
     "src/gpu/recomp/mod.rs",
+    "src/gpu/recomp/partial_waves.rs",
     "src/gpu/recomp/upper_lanes.rs",
     "src/gpu/recomp/x64_masks.rs",
     "src/gpu/shader.rs",

@@ -778,6 +778,23 @@ mod shader_cache_tests {
         assert_ne!(a, translated::identity_for("source-a", "dxc-b"));
     }
 
+    /// Every module a translation depends on is in build.rs's source identity; otherwise a
+    /// change to that file alone reuses the translations on disk.
+    #[test]
+    fn translated_identity_covers_the_recompiler_modules() {
+        // cache and pipeline setup, run-time dispatch, test support: not part of a translation
+        let not_translation = ["heap_window_tests", "mesh_dispatch", "pso", "runner", "tests"];
+        let hashed = include_str!("../../../build.rs");
+        let mut missing = Vec::new();
+        for line in include_str!("mod.rs").lines() {
+            let Some(name) = line.strip_prefix("pub(crate) ").or(line.strip_prefix("pub ")).unwrap_or(line).strip_prefix("mod ").and_then(|l| l.strip_suffix(';')) else { continue };
+            if !not_translation.contains(&name) && !hashed.contains(&format!("\"src/gpu/recomp/{name}.rs\"")) {
+                missing.push(name);
+            }
+        }
+        assert!(missing.is_empty(), "not in TRANSLATOR_SOURCES: {missing:?}");
+    }
+
     #[test]
     fn translated_namespace_tracks_every_request_input() {
         let dir = PathBuf::from("cache");
