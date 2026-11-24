@@ -453,14 +453,42 @@ impl VlcTable {
 // ---------------------------------------------------------------------------------------
 
 /// Precomputed twiddle tables for one power-of-two IMDCT-half size (`N = 64, 128, 256, 512`).
-struct ImdctPlan {
+enum ImdctPlan {
+    Scalar(ScalarImdct),
+    #[cfg(target_arch = "x86_64")]
+    Avx2(Avx2Imdct),
+}
+
+impl ImdctPlan {
+    fn new(n: usize, bits_per_sample: u8) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        if n >= 32 && std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            return Self::Avx2(Avx2Imdct::new(n, bits_per_sample));
+        }
+        Self::Scalar(ScalarImdct::new(n, bits_per_sample))
+    }
+
+    fn imdct_half(&self, src: &[f32], dst: &mut [f32]) {
+        match self {
+            Self::Scalar(plan) => plan.imdct_half(src, dst),
+            #[cfg(target_arch = "x86_64")]
+            // Construction checks both CPU features. The vector code accesses n elements.
+            Self::Avx2(plan) => {
+                assert!(src.len() >= plan.n && dst.len() >= plan.n);
+                unsafe { plan.imdct_half_avx2(src, dst) }
+            }
+        }
+    }
+}
+
+struct ScalarImdct {
     n: usize,
     exp: Vec<(f32, f32)>,
     fft_twiddles: Vec<(f32, f32)>, // size N/4: exp(+i * 2*PI * k / (N/2)) for inverse FFT
     bitrev: Vec<usize>,
 }
 
-impl ImdctPlan {
+impl ScalarImdct {
     fn new(n: usize, bits_per_sample: u8) -> Self {
         debug_assert!(n.is_power_of_two() && n >= 8);
         let len2 = n / 2;
@@ -536,6 +564,205 @@ impl ImdctPlan {
             dst[2 * i0 + 1] = s1r * e1r + s1i * e1i;
             dst[2 * i0] = s0r * e0i - s0i * e0r;
             dst[2 * i1 + 1] = s0r * e0r + s0i * e0i;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+struct Avx2Imdct {
+    n: usize,
+    exp_r: Vec<f32>,
+    exp_i: Vec<f32>,
+    // Stage-contiguous inverse FFT twiddles W_M^{+k} = cos(2*PI*k/M) + i*sin(2*PI*k/M).
+    // Stage `half` (1, 2, 4, ..., N/4) occupies slice `[half - 1 .. 2 * half - 1]`.
+    stage_tw_r: Vec<f32>,
+    stage_tw_i: Vec<f32>,
+    bitrev: Vec<usize>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Avx2Imdct {
+    fn new(n: usize, bits_per_sample: u8) -> Self {
+        debug_assert!(n.is_power_of_two() && n >= 8);
+        let len2 = n / 2;
+        let scale = 1.0_f64 / (len2 as f64) / ((1u64 << (bits_per_sample - 1)) as f64);
+        let s_sqrt = scale.sqrt();
+
+        // Matches ff_tx_mdct_gen_exp (scale > 0, theta = 1/8).
+        let mut exp_r = Vec::with_capacity(len2);
+        let mut exp_i = Vec::with_capacity(len2);
+        for i in 0..len2 {
+            let alpha = (PI * 0.5) * (i as f64 + 0.125) / (len2 as f64);
+            exp_r.push((alpha.cos() * s_sqrt) as f32);
+            exp_i.push((alpha.sin() * s_sqrt) as f32);
+        }
+
+        // Contiguous inverse FFT twiddles per radix-2 stage for unit-stride SIMD loads.
+        let mut stage_tw_r = Vec::with_capacity(len2.saturating_sub(1));
+        let mut stage_tw_i = Vec::with_capacity(len2.saturating_sub(1));
+        let mut half = 1usize;
+        while half < len2 {
+            let step = half * 2;
+            for j in 0..half {
+                let angle = (2.0 * PI * j as f64) / (step as f64);
+                stage_tw_r.push(angle.cos() as f32);
+                stage_tw_i.push(angle.sin() as f32);
+            }
+            half = step;
+        }
+
+        let log_m = len2.trailing_zeros();
+        let bitrev = (0..len2).map(|i| i.reverse_bits() >> (usize::BITS - log_m)).collect();
+
+        Self { n, exp_r, exp_i, stage_tw_r, stage_tw_i, bitrev }
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn imdct_half_avx2(&self, src: &[f32], dst: &mut [f32]) {
+        use std::arch::x86_64::{
+            _mm256_add_ps, _mm256_castps_si256, _mm256_castsi256_ps, _mm256_fmadd_ps, _mm256_fmsub_ps,
+            _mm256_load_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_permute2f128_ps, _mm256_permute4x64_epi64,
+            _mm256_permutevar8x32_ps, _mm256_setr_epi32, _mm256_shuffle_ps, _mm256_store_ps, _mm256_storeu_ps,
+            _mm256_sub_ps, _mm256_unpackhi_ps, _mm256_unpacklo_ps, _mm_add_ps, _mm_fmadd_ps, _mm_fmsub_ps,
+            _mm_load_ps, _mm_loadu_ps, _mm_mul_ps, _mm_store_ps, _mm_sub_ps,
+        };
+
+        let n = self.n;
+        let len2 = n / 2;
+        let len4 = n / 4;
+        debug_assert!(n >= 32 && n <= 512 && src.len() >= n && dst.len() >= n);
+
+        #[repr(align(32))]
+        struct Aligned([f32; 256]);
+        let mut zr = Aligned([0.0f32; 256]);
+        let mut zi = Aligned([0.0f32; 256]);
+        let zrp = zr.0.as_mut_ptr();
+        let zip = zi.0.as_mut_ptr();
+        let exp_r = self.exp_r.as_ptr();
+        let exp_i = self.exp_i.as_ptr();
+        let rev = _mm256_setr_epi32(7, 6, 5, 4, 3, 2, 1, 0);
+
+        // 1. Pre-rotation (8 complex values/iter) with bit-reversed store into SoA `zr`/`zi`.
+        let src_p = src.as_ptr();
+        for i in (0..len2).step_by(8) {
+            let f0 = _mm256_loadu_ps(src_p.add(2 * i));
+            let f1 = _mm256_loadu_ps(src_p.add(2 * i + 8));
+            let im_in = _mm256_castsi256_ps(_mm256_permute4x64_epi64(
+                _mm256_castps_si256(_mm256_shuffle_ps(f0, f1, 0x88)),
+                0xD8,
+            ));
+            let b0 = _mm256_loadu_ps(src_p.add(n - 16 - 2 * i));
+            let b1 = _mm256_loadu_ps(src_p.add(n - 8 - 2 * i));
+            let re_fwd = _mm256_castsi256_ps(_mm256_permute4x64_epi64(
+                _mm256_castps_si256(_mm256_shuffle_ps(b0, b1, 0xDD)),
+                0xD8,
+            ));
+            let re_in = _mm256_permutevar8x32_ps(re_fwd, rev);
+            let er = _mm256_loadu_ps(exp_r.add(i));
+            let ei = _mm256_loadu_ps(exp_i.add(i));
+            let out_r = _mm256_fmsub_ps(re_in, er, _mm256_mul_ps(im_in, ei));
+            let out_i = _mm256_fmadd_ps(re_in, ei, _mm256_mul_ps(im_in, er));
+            let mut tr = [0.0f32; 8];
+            let mut ti = [0.0f32; 8];
+            _mm256_storeu_ps(tr.as_mut_ptr(), out_r);
+            _mm256_storeu_ps(ti.as_mut_ptr(), out_i);
+            for m in 0..8 {
+                let idx = *self.bitrev.get_unchecked(i + m);
+                *zrp.add(idx) = tr[m];
+                *zip.add(idx) = ti[m];
+            }
+        }
+
+        // 2a. Fused multiply-free stages `half = 1` (W = 1) and `half = 2` (W = 1, +i).
+        for base in (0..len2).step_by(4) {
+            let (r0, r1, r2, r3) = (*zrp.add(base), *zrp.add(base + 1), *zrp.add(base + 2), *zrp.add(base + 3));
+            let (i0, i1, i2, i3) = (*zip.add(base), *zip.add(base + 1), *zip.add(base + 2), *zip.add(base + 3));
+            let (ar0, ai0) = (r0 + r1, i0 + i1);
+            let (ar1, ai1) = (r0 - r1, i0 - i1);
+            let (ar2, ai2) = (r2 + r3, i2 + i3);
+            let (ar3, ai3) = (r2 - r3, i2 - i3);
+            *zrp.add(base) = ar0 + ar2;
+            *zip.add(base) = ai0 + ai2;
+            *zrp.add(base + 2) = ar0 - ar2;
+            *zip.add(base + 2) = ai0 - ai2;
+            *zrp.add(base + 1) = ar1 - ai3;
+            *zip.add(base + 1) = ai1 + ar3;
+            *zrp.add(base + 3) = ar1 + ai3;
+            *zip.add(base + 3) = ai1 - ar3;
+        }
+
+        // 2b. Stage `half = 4`: 4-wide VEX 128-bit FMA butterflies (twiddles loaded once).
+        let wr4 = _mm_loadu_ps(self.stage_tw_r.as_ptr().add(3));
+        let wi4 = _mm_loadu_ps(self.stage_tw_i.as_ptr().add(3));
+        for base in (0..len2).step_by(8) {
+            let ur = _mm_load_ps(zrp.add(base));
+            let ui = _mm_load_ps(zip.add(base));
+            let vr = _mm_load_ps(zrp.add(base + 4));
+            let vi = _mm_load_ps(zip.add(base + 4));
+            let tr = _mm_fmsub_ps(vr, wr4, _mm_mul_ps(vi, wi4));
+            let ti = _mm_fmadd_ps(vr, wi4, _mm_mul_ps(vi, wr4));
+            _mm_store_ps(zrp.add(base), _mm_add_ps(ur, tr));
+            _mm_store_ps(zip.add(base), _mm_add_ps(ui, ti));
+            _mm_store_ps(zrp.add(base + 4), _mm_sub_ps(ur, tr));
+            _mm_store_ps(zip.add(base + 4), _mm_sub_ps(ui, ti));
+        }
+
+        // 2c. Stages `half = 8, 16, ..., len2 / 2`: 8-wide AVX2+FMA aligned butterflies.
+        let mut half = 8usize;
+        while half < len2 {
+            let step = half * 2;
+            let tw_r = self.stage_tw_r.as_ptr().add(half - 1);
+            let tw_i = self.stage_tw_i.as_ptr().add(half - 1);
+            for base in (0..len2).step_by(step) {
+                for j in (0..half).step_by(8) {
+                    let wr = _mm256_loadu_ps(tw_r.add(j));
+                    let wi = _mm256_loadu_ps(tw_i.add(j));
+                    let ur = _mm256_load_ps(zrp.add(base + j));
+                    let ui = _mm256_load_ps(zip.add(base + j));
+                    let vr = _mm256_load_ps(zrp.add(base + j + half));
+                    let vi = _mm256_load_ps(zip.add(base + j + half));
+                    let tr = _mm256_fmsub_ps(vr, wr, _mm256_mul_ps(vi, wi));
+                    let ti = _mm256_fmadd_ps(vr, wi, _mm256_mul_ps(vi, wr));
+                    _mm256_store_ps(zrp.add(base + j), _mm256_add_ps(ur, tr));
+                    _mm256_store_ps(zip.add(base + j), _mm256_add_ps(ui, ti));
+                    _mm256_store_ps(zrp.add(base + j + half), _mm256_sub_ps(ur, tr));
+                    _mm256_store_ps(zip.add(base + j + half), _mm256_sub_ps(ui, ti));
+                }
+            }
+            half = step;
+        }
+
+        // 3. Post-rotation & interleave (16 output samples per iteration).
+        let dst_p = dst.as_mut_ptr();
+        for i in (0..len4).step_by(8) {
+            let b0 = len4 + i;
+            let b1 = len4 - i - 8;
+            let s0r = _mm256_load_ps(zip.add(b0));
+            let s0i = _mm256_load_ps(zrp.add(b0));
+            let e0r = _mm256_loadu_ps(exp_r.add(b0));
+            let e0i = _mm256_loadu_ps(exp_i.add(b0));
+
+            let s1r = _mm256_load_ps(zip.add(b1));
+            let s1i = _mm256_load_ps(zrp.add(b1));
+            let e1r = _mm256_loadu_ps(exp_r.add(b1));
+            let e1i = _mm256_loadu_ps(exp_i.add(b1));
+
+            let p0_even = _mm256_fmsub_ps(s0r, e0i, _mm256_mul_ps(s0i, e0r));
+            let p0_odd = _mm256_fmadd_ps(s0r, e0r, _mm256_mul_ps(s0i, e0i));
+            let p1_even = _mm256_fmsub_ps(s1r, e1i, _mm256_mul_ps(s1i, e1r));
+            let p1_odd = _mm256_fmadd_ps(s1r, e1r, _mm256_mul_ps(s1i, e1i));
+
+            let p1_odd_rev = _mm256_permutevar8x32_ps(p1_odd, rev);
+            let lo0 = _mm256_unpacklo_ps(p0_even, p1_odd_rev);
+            let hi0 = _mm256_unpackhi_ps(p0_even, p1_odd_rev);
+            _mm256_storeu_ps(dst_p.add(2 * b0), _mm256_permute2f128_ps(lo0, hi0, 0x20));
+            _mm256_storeu_ps(dst_p.add(2 * b0 + 8), _mm256_permute2f128_ps(lo0, hi0, 0x31));
+
+            let p0_odd_rev = _mm256_permutevar8x32_ps(p0_odd, rev);
+            let lo1 = _mm256_unpacklo_ps(p1_even, p0_odd_rev);
+            let hi1 = _mm256_unpackhi_ps(p1_even, p0_odd_rev);
+            _mm256_storeu_ps(dst_p.add(2 * b1), _mm256_permute2f128_ps(lo1, hi1, 0x20));
+            _mm256_storeu_ps(dst_p.add(2 * b1 + 8), _mm256_permute2f128_ps(lo1, hi1, 0x31));
         }
     }
 }
@@ -2129,6 +2356,35 @@ pub(crate) mod tests {
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
             assert!(max_err < 1e-5, "IMDCT size {n}: max_err={max_err}");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_imdct_matches_scalar_for_all_xma_sizes() {
+        if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")) {
+            return;
+        }
+        for bits in BLOCK_MIN_BITS..=BLOCK_MAX_BITS {
+            let n = 1usize << bits;
+            let plan = ImdctPlan::new(n, 16);
+            assert!(matches!(plan, ImdctPlan::Avx2(_)));
+            let fallback = ImdctPlan::Scalar(ScalarImdct::new(n, 16));
+            for seed in 0..4usize {
+                let src: Vec<f32> = (0..n)
+                    .map(|k| (((k + seed * 17) as f32 * 0.73).sin() * 12345.0) - (((k * 3 + seed) as f32 * 0.19).cos() * 4000.0))
+                    .collect();
+                let mut scalar = vec![0.0f32; n];
+                let mut simd = vec![0.0f32; n];
+                fallback.imdct_half(&src, &mut scalar);
+                plan.imdct_half(&src, &mut simd);
+                let max_err = scalar
+                    .iter()
+                    .zip(simd.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(max_err < 1e-5, "AVX2 vs scalar IMDCT size {n} seed {seed}: max_err={max_err}");
+            }
         }
     }
 
