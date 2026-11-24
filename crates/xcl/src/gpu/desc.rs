@@ -656,14 +656,24 @@ mod view_tests {
         assert!(b[3] >> 28 < 8, "BVH descriptor must not look like a T# image to CopyDescriptors");
         assert_eq!(bvh_words(0x12_3456_789A_00, false)[1], 0x12);
     }
+
+    #[test]
+    fn format_bytes_covers_packed_16bit_and_32bit_formats() {
+        assert_eq!((format_bytes(1), format_bytes(7), format_bytes(20), format_bytes(62), format_bytes(72), format_bytes(75)), (1, 2, 4, 8, 12, 16));
+        assert_eq!((format_bytes(130), format_bytes(132)), (4, 4));
+        assert_eq!((format_bytes(133), format_bytes(134), format_bytes(135), format_bytes(136)), (2, 2, 2, 2));
+        assert_eq!(format_bytes(gfx10_format(DXGI_FORMAT_B5G6R5_UNORM).unwrap()), 2);
+        assert_eq!(format_bytes(gfx10_format(DXGI_FORMAT_B5G5R5A1_UNORM).unwrap()), 2);
+        assert_eq!(format_bytes(gfx10_format(DXGI_FORMAT_B4G4R4A4_UNORM).unwrap()), 2);
+    }
 }
 
-/// Bytes per element of a GFX10 buffer / image format (0–77: 8, 16, 32, 64, 96, 128 bits).
+/// Bytes per element of a GFX10 buffer / image format (8, 16, 32, 64, 96, 128 bits).
 pub fn format_bytes(f: u32) -> u32 {
     match f {
         1..=6 => 1,
-        7..=19 => 2,
-        20..=61 => 4,
+        7..=19 | 133..=136 => 2,
+        20..=61 | 130 | 132 => 4,
         62..=71 => 8,
         72..=74 => 12,
         75..=77 => 16,

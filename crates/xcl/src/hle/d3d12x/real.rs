@@ -1759,10 +1759,53 @@ unsafe extern "system" fn res_gpu_va_x(this: *mut c_void) -> u64 {
     }
 }
 
+/// The console's D3D12_RESOURCE_DESC of the PC one `d` with texture layout `layout`.
+fn console_desc(d: &D3D12_RESOURCE_DESC, layout: u32) -> [u8; 0x38] {
+    let mut x = [0u8; 0x38];
+    x[0..4].copy_from_slice(&d.Dimension.0.to_le_bytes());
+    x[0x10..0x18].copy_from_slice(&d.Width.to_le_bytes());
+    x[0x18..0x1C].copy_from_slice(&d.Height.to_le_bytes());
+    x[0x1C..0x1E].copy_from_slice(&d.DepthOrArraySize.to_le_bytes());
+    x[0x1E..0x20].copy_from_slice(&d.MipLevels.to_le_bytes());
+    x[0x20..0x24].copy_from_slice(&d.Format.0.to_le_bytes());
+    x[0x24..0x28].copy_from_slice(&d.SampleDesc.Count.to_le_bytes());
+    x[0x2C..0x30].copy_from_slice(&layout.to_le_bytes());
+    x[0x30..0x34].copy_from_slice(&d.Flags.0.to_le_bytes());
+    x
+}
+
+/// Bytes `texture_memory` reserves for a texture of the PC description `d` (None: over 1 GiB):
+/// its texels + a third for mips and 64 KiB of padding. 16-bit texels: at least the largest
+/// console layout that fits – whole blocks of 256x128 texels or rows of 256 bytes take more than
+/// that, and the PC description does not say which one the title asked for.
+fn texture_memory_bytes(d: &D3D12_RESOURCE_DESC) -> Option<u64> {
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B4G4R4A4_UNORM, DXGI_FORMAT_B5G5R5A1_UNORM, DXGI_FORMAT_B5G6R5_UNORM};
+    let bits = crate::gpu::desc::gfx10_format(d.Format).map_or(128, |f| crate::gpu::desc::format_bytes(f).max(1) as u64 * 8);
+    let texels = d.Width.checked_mul(d.Height as u64)?.checked_mul(d.DepthOrArraySize.max(1) as u64)?;
+    let pad = |bytes: u64| (bytes + 0x1_0000).next_multiple_of(0x1_0000);
+    let bytes = Some(pad(texels.checked_mul(bits)? / 8 * 4 / 3)).filter(|&b| b <= 1 << 30)?;
+    if crate::hle::xg::element(d.Format.0 as u32) != Some((1, 1)) {
+        return Some(bytes);
+    }
+    let mut layouts = (0x100..=0x11F).filter_map(|l| Some(crate::hle::xg::Texture::new(&console_desc(d, l)).ok()?.size())).peekable();
+    // a layout counts against the 1 GiB without its padding, which is cut off there
+    if layouts.peek().is_some() {
+        let fitting = layouts.filter(|&b| b <= 1 << 30).max();
+        return Some(fitting.map_or(bytes, |size| bytes.max(pad(size).min(1 << 30))));
+    }
+    if matches!(d.Format, DXGI_FORMAT_B5G6R5_UNORM | DXGI_FORMAT_B5G5R5A1_UNORM | DXGI_FORMAT_B4G4R4A4_UNORM) {
+        // For unmodeled packed layouts keep at least the previous four-byte estimate.
+        let previous = pad(texels * 4 * 4 / 3);
+        // Keep one third of the sample bytes as headroom for block padding, within the cap.
+        let samples = texels.saturating_mul(2 * u64::from(d.SampleDesc.Count)).min(1 << 30);
+        return Some(previous.max(pad(samples * 4 / 3)).min(1 << 30));
+    }
+    Some(bytes)
+}
+
 /// Memory for a texture the title did not place itself (a committed one) asking for its
-/// address – on the console every texture has one (see `res_gpu_va_x`). Address space for the
-/// texels of the PC description (+ a third for mips and 64 KiB of padding), its pages committed
-/// as the title writes them (`kernelx::lazy`): the clears of GPU-written targets seen so far
+/// address – on the console every texture has one (see `res_gpu_va_x`). Address space
+/// (`texture_memory_bytes`), its pages committed as the title writes them (`kernelx::lazy`): the clears of GPU-written targets seen so far
 /// cost nothing until done. What the title writes there is not uploaded to the texture, and the
 /// memory stays with the address (not freed with the resource).
 unsafe fn texture_memory(res: *mut c_void) -> Option<usize> {
@@ -1776,12 +1819,7 @@ unsafe fn texture_memory(res: *mut c_void) -> Option<usize> {
     if d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
         return None;
     }
-    let bits = crate::gpu::desc::gfx10_format(d.Format).map_or(128, |f| crate::gpu::desc::format_bytes(f).max(1) as u64 * 8);
-    let texels = d.Width.checked_mul(d.Height as u64)?.checked_mul(d.DepthOrArraySize.max(1) as u64)?;
-    let bytes = (texels.checked_mul(bits)? / 8 * 4 / 3 + 0x1_0000).next_multiple_of(0x1_0000);
-    if bytes > 1 << 30 {
-        return None;
-    }
+    let bytes = texture_memory_bytes(&d)?;
     let p = VirtualAlloc(std::ptr::null(), bytes as usize, MEM_RESERVE, PAGE_READWRITE) as usize;
     if p == 0 {
         return None;
@@ -6126,6 +6164,128 @@ mod readback_routing_tests {
             assert_eq!(release(raw), 0);
             assert!(!super::super::list_x::has_list_state(key), "releasing DMA list must remove its list_x::LISTS entry");
         }
+    }
+}
+
+#[cfg(test)]
+mod texture_memory_tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
+
+    fn pc_desc(width: u64, height: u32, array: u16, mips: u16, format: DXGI_FORMAT) -> D3D12_RESOURCE_DESC {
+        D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: width,
+            Height: height,
+            DepthOrArraySize: array,
+            MipLevels: mips,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        }
+    }
+
+    /// Bytes of the texture in console layout `layout` (0x100 | swizzle mode).
+    fn console_bytes(d: &D3D12_RESOURCE_DESC, layout: u32) -> u64 {
+        crate::hle::xg::Texture::new(&console_desc(d, layout)).unwrap_or_else(|e| panic!("layout {layout:#x}: {e:#x}")).size()
+    }
+
+    /// 2048x130 in 16-bit texels: 8x2 blocks of 256x128 texels in the 64 KB modes (1 MiB, the
+    /// texels alone are 520 KB); the rows of the linear layout are a multiple of 256 B already.
+    /// R16_UNORM, R8G8_UNORM, R16_FLOAT, B5G6R5, B5G5R5A1, B4G4R4A4.
+    #[test]
+    fn a_16bit_texture_reserves_its_tiled_layout() {
+        let reserved = [56, 49, 54, 85, 86, 115].map(|f| {
+            let d = pc_desc(2048, 130, 1, 1, DXGI_FORMAT(f));
+            assert_eq!(console_bytes(&d, 0x100), 2048 * 130 * 2, "format {f}: linear");
+            assert_eq!(console_bytes(&d, 0x105), 2048 * 160 * 2, "format {f}: 4KB_S");
+            for layout in [0x109, 0x10A, 0x11B] {
+                assert_eq!(console_bytes(&d, layout), 0x10_0000, "format {f}: layout {layout:#x}");
+            }
+            (f, texture_memory_bytes(&d).unwrap())
+        });
+        println!("2048x130: {reserved:#x?}");
+        assert!(reserved.iter().all(|r| r.1 >= 0x10_0000), "{reserved:#x?}");
+    }
+
+    /// The pitch of a linear texture is a multiple of 256 bytes; narrow tiled ones are a block
+    /// wide.
+    #[test]
+    fn a_16bit_texture_reserves_its_linear_pitch() {
+        let reserved = [56, 85, 86, 115].map(|f| {
+            let d = pc_desc(1, 4096, 1, 1, DXGI_FORMAT(f));
+            assert_eq!(console_bytes(&d, 0x100), 256 * 4096, "format {f}: linear");
+            assert_eq!(console_bytes(&d, 0x109), 32 * 0x1_0000, "format {f}: 64KB_S");
+            (f, texture_memory_bytes(&d).unwrap())
+        });
+        println!("1x4096: {reserved:#x?}");
+        assert!(reserved.iter().all(|r| r.1 >= 32 * 0x1_0000), "{reserved:#x?}");
+    }
+
+    /// Every slice and every level is padded, and the depth of a 3D texture.
+    #[test]
+    fn a_16bit_texture_reserves_its_slices_and_levels() {
+        for (w, h, array, mips) in [(2048, 130, 6, 1), (2048, 130, 1, 12), (16, 16, 64, 5)] {
+            let d = pc_desc(w, h, array, mips, DXGI_FORMAT(85));
+            let bytes = texture_memory_bytes(&d).unwrap();
+            for layout in [0x100, 0x105, 0x109, 0x10A, 0x11B] {
+                let want = console_bytes(&d, layout);
+                assert!(bytes >= want, "{w}x{h}x{array}, {mips} mips, layout {layout:#x}: {bytes:#x} of {want:#x}");
+            }
+        }
+        let d = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE3D, ..pc_desc(33, 33, 33, 1, DXGI_FORMAT(85)) };
+        let bytes = texture_memory_bytes(&d).unwrap();
+        for layout in [0x100, 0x105, 0x109] {
+            let want = console_bytes(&d, layout);
+            assert!(bytes >= want, "33x33x33, layout {layout:#x}: {bytes:#x} of {want:#x}");
+        }
+    }
+
+    /// A layout of exactly 1 GiB fits, without the padding: 128 slices of 128 blocks of 64 KB.
+    #[test]
+    fn a_16bit_texture_reserves_a_layout_of_1_gib() {
+        let d = pc_desc(1, 16384, 128, 1, DXGI_FORMAT(56));
+        assert_eq!(console_bytes(&d, 0x109), 1 << 30);
+        assert_eq!(texture_memory_bytes(&d), Some(1 << 30));
+    }
+
+    #[test]
+    fn packed_msaa_reserves_at_least_its_previous_fallback() {
+        for format in [85, 86, 115] {
+            let mut d = pc_desc(2048, 130, 1, 1, DXGI_FORMAT(format));
+            d.SampleDesc.Count = 2;
+            assert!(texture_memory_bytes(&d).unwrap() >= 0x17_0000, "format {format}");
+        }
+    }
+
+    #[test]
+    fn packed_layouts_above_the_cap_keep_the_texel_estimate() {
+        let d = pc_desc(17, 8192, 1700, 2, DXGI_FORMAT(85));
+        assert_eq!(texture_memory_bytes(&d), Some(0x25A3_0000));
+    }
+
+    #[test]
+    fn packed_msaa_reservations_keep_fitting_sample_bytes() {
+        let mut hd = pc_desc(1280, 720, 1, 1, DXGI_FORMAT(85));
+        hd.SampleDesc.Count = 4;
+        assert!(texture_memory_bytes(&hd).unwrap() >= 0x78_0000, "packed 4x block padding");
+        for (side, slices, samples, raw) in [(4096, 6, 4, 768 << 20), (8192, 1, 8, 1 << 30)] {
+            let mut d = pc_desc(side, side as u32, slices, 1, DXGI_FORMAT(85));
+            d.SampleDesc.Count = samples;
+            assert!(texture_memory_bytes(&d).is_some_and(|size| size >= raw && size <= 1 << 30), "{samples} samples");
+        }
+    }
+
+    /// Other element sizes keep their estimate; a layout over 1 GiB does not refuse a texture
+    /// whose estimate is below it.
+    #[test]
+    fn other_texture_reservations_are_unchanged() {
+        for (f, want) in [(61, 0x7_0000), (28, 0x17_0000), (10, 0x2D_0000)] {
+            assert_eq!(texture_memory_bytes(&pc_desc(2048, 130, 1, 1, DXGI_FORMAT(f))), Some(want), "format {f}");
+        }
+        let narrow = pc_desc(1, 16384, 2048, 1, DXGI_FORMAT(56));
+        assert!(console_bytes(&narrow, 0x100) > 1 << 30 && texture_memory_bytes(&narrow).is_some());
+        assert_eq!(texture_memory_bytes(&pc_desc(16384, 16384, 4, 1, DXGI_FORMAT(56))), None);
     }
 }
 
