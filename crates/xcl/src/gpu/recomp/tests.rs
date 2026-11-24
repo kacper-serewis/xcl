@@ -7087,6 +7087,46 @@ fn ps_interp_p0_preserves_bits_and_p2_converts_to_float() {
     }
 }
 
+/// The ancillary VGPR (SPI_PS_INPUT_ENA bit 13) holds the sample index in [11:8];
+/// POS_FIXED_PT (bit 15) the integer pixel x in [15:0] and y in [31:16]. Each starts from its
+/// SV_ value, and SV_SampleIndex (which makes the PC PS run per sample) is declared only when
+/// the console's input signature has it.
+#[test]
+fn ps_ancillary_and_pos_fixed_vgprs() {
+    use super::PsInterface;
+    let ps = |ena: u32, inputs: Vec<crate::gpu::dxbc::SigElement>, src: u64| {
+        let code = prog(&[
+            ("V_BFE_U32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V + src), ("SRC1", 136), ("SRC2", 132)], None),
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 1), ("VSRC0", 3), ("DONE", 1), ("VM", 1)], None),
+        ]);
+        let psi = PsInterface { inputs, outputs: vec![el("SV_Target", 0, 64, 1, 0, 0xF)], input_ena: ena, attrs: None };
+        let pt = translate(&code, &Options { mode: Mode::Pixel(psi), wave64: true, ..Default::default() }).unwrap();
+        assert!(pt.complete(), "{:?}\n{}", pt.unsupported_why, pt.hlsl);
+        if super::dxc::location().is_ok() {
+            super::dxc::compile(&pt.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", pt.hlsl));
+        }
+        pt.hlsl
+    };
+    // sample index (and render-target array index) in the ancillary VGPR v2
+    let h = ps(0x2002, vec![el("SV_SampleIndex", 0, 10, 1, 0, 1)], 2);
+    assert!(h.contains("uint xcl_si : SV_SampleIndex;") && !h.contains("uint v2 = 0u;"), "{h}");
+    assert!(h.contains("uint v2 = ((xi.xcl_si & 0xFu) << 8);"), "{h}");
+    // SV_RenderTargetArrayIndex links to an output of the stage before, which the translated
+    // VS / GS do not write (`ranked` drops it): it stays undeclared, its bits 0
+    let h = ps(0x2002, vec![el("SV_SampleIndex", 0, 10, 1, 0, 1), el("SV_RenderTargetArrayIndex", 0, 4, 1, 1, 1)], 2);
+    assert!(h.contains("uint v2 = ((xi.xcl_si & 0xFu) << 8);") && !h.contains("SV_RenderTargetArrayIndex"), "{h}");
+    // the ancillary VGPR without either in the signature: no per-sample PS
+    let h = ps(0x2002, vec![], 2);
+    assert!(h.contains("uint v2 = 0u;") && !h.contains("SV_SampleIndex"), "{h}");
+    // POS_FIXED_PT in v2, from SV_Position
+    let h = ps(0x8002, vec![], 2);
+    assert!(h.contains("uint v2 = ((uint)xi.xcl_pos.x & 0xFFFFu) | ((uint)xi.xcl_pos.y << 16);"), "{h}");
+    // neither: the interface and start values are those of before
+    let h = ps(0x0302, vec![el("SV_Position", 0, 1, 3, 0, 0xF)], 2);
+    assert!(h.contains("struct XclIn {\n    float4 xcl_pos : SV_Position;\n};\nstruct XclOut {\n    uint4 t0 : SV_Target0;\n};\n"), "{h}");
+    assert!(h.contains("uint v2 = asuint(xi.xcl_pos.x);") && h.contains("uint v3 = asuint(xi.xcl_pos.y);") && h.contains("uint v0 = 0u;"), "{h}");
+}
+
 #[test]
 fn gpu_ds_swizzle_and_bpermute_zero_inactive_lanes() {
     let run_case = |wave64: bool, split_wave64: bool| {

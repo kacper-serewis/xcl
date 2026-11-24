@@ -4665,6 +4665,15 @@ impl Em {
                 if ps.input_ena >> 14 & 1 == 1 {
                     h.push_str("    uint xcl_cov : SV_Coverage;\n");
                 }
+                // the ancillary VGPR's sample index (Mesa, ac_nir_lower_intrinsics_to_args.c:
+                // load_sample_id is ancillary bits [11:8]); SV_SampleIndex makes the PS run per
+                // sample, so only when the console's signature has it. Its render-target array
+                // index ([28:16]) stays 0: SV_RenderTargetArrayIndex links to an output of the
+                // stage before, which the translated VS / GS do not write
+                let si = ps.input_ena >> 13 & 1 == 1 && ps.inputs.iter().any(|e| e.system_value == 10);
+                if si {
+                    h.push_str("    uint xcl_si : SV_SampleIndex;\n");
+                }
                 h.push_str("};\nstruct XclOut {\n");
                 for e in &ps.outputs {
                     match e.system_value {
@@ -4699,8 +4708,13 @@ impl Em {
                         "asuint(xi.xcl_pos.w)"
                     } else if Some(v) == sys(12) {
                         "asuint(xi.xcl_ff ? 1.0f : 0.0f)"
+                    } else if Some(v) == sys(13) && si {
+                        "((xi.xcl_si & 0xFu) << 8)"
                     } else if Some(v) == sys(14) {
                         "xi.xcl_cov"
+                    } else if Some(v) == sys(15) {
+                        // POS_FIXED_PT: integer pixel x in [15:0], y in [31:16] (Mesa: load_pixel_coord)
+                        "((uint)xi.xcl_pos.x & 0xFFFFu) | ((uint)xi.xcl_pos.y << 16)"
                     } else {
                         "0u"
                     };
