@@ -145,7 +145,7 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
     let int64_typed_atomic = int64_typed_atomic();
     let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64, int64_typed_atomic);
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
-        return compile_one();
+        return compile_one().map_err(dxc::Failure::message);
     }
     static CACHE: OnceLock<Mutex<ShaderCache>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(ShaderCache::new(64 << 20)));
@@ -177,6 +177,7 @@ mod translated {
     use std::sync::OnceLock;
 
     const MAGIC: &[u8; 8] = b"XCLTRAN2";
+    const ERR_MAGIC: &[u8; 8] = b"XCLTERR2";
 
     pub(super) fn identity_for(source: &str, toolchain: &str) -> u64 {
         let mut h = 0xcbf2_9ce4_8422_2325u64;
@@ -305,6 +306,14 @@ mod translated {
         }
     }
 
+    fn err_header(ident: u64, blob: &[u8]) -> Vec<u8> {
+        let mut h = ERR_MAGIC.to_vec();
+        for v in [ident, blob.len() as u64, hash2(blob)] {
+            h.extend_from_slice(&v.to_le_bytes());
+        }
+        h
+    }
+
     pub(super) fn cached_in(
         dir: &Path,
         ident: u64,
@@ -314,19 +323,35 @@ mod translated {
         windows: u32,
         split: bool,
         int64_typed_atomic: bool,
-        translate: impl FnOnce() -> Result<Compiled, String>,
+        translate: impl FnOnce() -> Result<Compiled, super::dxc::Failure>,
     ) -> Result<Compiled, String> {
         if ident == 0 {
-            return translate();
+            return translate().map_err(super::dxc::Failure::message);
         }
         let path = file(dir, ident, blob, stage, sampler_base, windows, split, int64_typed_atomic);
+        let err_path = path.with_extension("err");
         if let Some(c) = load_in(&path, ident, blob) {
             super::dxc::note_memory_hit();
             return Ok(c);
         }
-        let c = translate()?;
-        store_in(&path, ident, blob, &c);
-        Ok(c)
+        let err_header = err_header(ident, blob);
+        if let Some(reason) = super::dxc::read_rejection(&err_path, &err_header) {
+            return Err(reason);
+        }
+        match translate() {
+            Ok(c) => {
+                if err_path.is_file() {
+                    let _ = std::fs::remove_file(&err_path);
+                }
+                store_in(&path, ident, blob, &c);
+                Ok(c)
+            }
+            Err(super::dxc::Failure::Rejected(reason)) => {
+                super::dxc::store_rejection(&err_path, &err_header, &reason);
+                Err(reason)
+            }
+            Err(super::dxc::Failure::Retry(reason)) => Err(reason),
+        }
     }
 
     /// `translate` through the disk (`identity()` zero: not used).
@@ -338,7 +363,7 @@ mod translated {
         windows: u32,
         split: bool,
         int64_typed_atomic: bool,
-        translate: impl FnOnce() -> Result<Compiled, String>,
+        translate: impl FnOnce() -> Result<Compiled, super::dxc::Failure>,
     ) -> Result<Compiled, String> {
         cached_in(dir, identity(), blob, stage, sampler_base, windows, split, int64_typed_atomic, translate)
     }
@@ -346,10 +371,11 @@ mod translated {
 
 // Changes here, in `fspx`, or in `console_translation` that alter the cached result must bump
 // `TRANSLATION_GLUE_REVISION` in build.rs; cache serialization changes need not bump it.
-fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool, int64_typed_atomic: bool) -> Result<Compiled, String> {
+fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool, int64_typed_atomic: bool) -> Result<Compiled, dxc::Failure> {
     // `XCL_DIRECT_DXIL=1`: compute shaders through the direct DXIL translator, the HLSL path
     // for what it cannot translate yet
-    if stage == Stage::Compute && crate::gpu::dxil::kernel::enabled() {
+    let direct_cs = stage == Stage::Compute && crate::gpu::dxil::kernel::enabled();
+    if direct_cs {
         match direct_compute(blob, sampler_base, windows, split_wave64) {
             Ok(c) => {
                 crate::gpu::dxil::coverage::record_translated("CS");
@@ -361,7 +387,8 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
     // `XCL_DIRECT_DXIL=all`: vertex / pixel shaders too (not with the PS debug hooks below)
     let ps_debug = stage == Stage::Pixel
         && (debug_color(blob).is_some() || ["XCL_DEBUG_LOD0", "XCL_DEBUG_PS_SUB", "XCL_DEBUG_PS_EXPR"].iter().any(|v| std::env::var_os(v).is_some()));
-    if stage != Stage::Compute && !ps_debug && crate::gpu::dxil::kernel::enabled_graphics() {
+    let direct_gfx = stage != Stage::Compute && !ps_debug && crate::gpu::dxil::kernel::enabled_graphics();
+    if direct_gfx {
         match direct_graphics(blob, stage, sampler_base, windows) {
             Ok(c) => {
                 crate::gpu::dxil::coverage::record_translated(if stage == Stage::Vertex { "VS" } else { "PS" });
@@ -370,7 +397,11 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
             Err(e) => direct_fallback(if stage == Stage::Vertex { "VS" } else { "PS" }, &e),
         }
     }
-    let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64, int64_typed_atomic)?;
+    // A direct attempt may have failed during validation. Retry that route on the
+    // next request even if its HLSL fallback deterministically refuses the shader.
+    let fallback = direct_cs || direct_gfx;
+    let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64, int64_typed_atomic)
+        .map_err(if fallback { dxc::Failure::Retry } else { dxc::Failure::Rejected })?;
     if let Some([r, g, b]) = (stage == Stage::Pixel).then(|| debug_color(blob)).flatten() {
         t.hlsl = t.hlsl.replacen("    return xo;\n}", &format!("    xo.t0 = float4({r:.3}, {g:.3}, {b:.3}, 1.0);\n    return xo;\n}}"), 1);
     }
@@ -400,7 +431,8 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
     }) {
         t.hlsl = t.hlsl.replacen("    if (!xcl_live) discard;\n    return xo;\n}", &format!("    xo.t0 = {expr};\n    return xo;\n}}"), 1);
     }
-    let dxil = dxc::compile_cached(&t.hlsl, "main", profile)?.0;
+    let dxil = dxc::compile_cached_classified(&dxc::cache_dir(), &t.hlsl, "main", profile)
+        .map_err(|e| if fallback { dxc::Failure::Retry(e.message()) } else { e })?.0;
     Ok(Compiled { dxil, samplers: t.static_samplers })
 }
 
@@ -558,7 +590,7 @@ fn cached_shader(
 }
 
 fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
-    !["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN", "XCL_CS_PAD_ALL", "XCL_NO_CS_PAD"]
+    !["XCL_SAFE_BARRIER", "XCL_DXIL_NO_OPT", "XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN", "XCL_CS_PAD_ALL", "XCL_NO_CS_PAD"]
         .iter()
         .any(|name| present(name))
         && (stage != Stage::Pixel
@@ -1243,7 +1275,7 @@ mod shader_cache_tests {
 
     #[test]
     fn shader_cache_bypasses_debug_overrides() {
-        for name in ["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN", "XCL_CS_PAD_ALL", "XCL_NO_CS_PAD"] {
+        for name in ["XCL_SAFE_BARRIER", "XCL_DXIL_NO_OPT", "XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN", "XCL_CS_PAD_ALL", "XCL_NO_CS_PAD"] {
             assert!(!cache_allowed(Stage::Compute, |v| v == name));
             assert!(!cache_allowed(Stage::Vertex, |v| v == name));
             assert!(!cache_allowed(Stage::Pixel, |v| v == name));
@@ -1323,6 +1355,108 @@ mod shader_cache_tests {
                 assert_eq!(thread.join().unwrap().unwrap().dxil[0], 1);
             }
         });
+    }
+
+    #[test]
+    fn translated_cache_caches_refusals_by_capability_identity() {
+        let dir = std::env::temp_dir().join(format!("xcl-translated-neg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let blob = b"console-shader-with-unsupported-op";
+        let ident_v1 = translated::identity_for("src-v1", "dxc-v1");
+        let ident_v2 = translated::identity_for("src-v2", "dxc-v1");
+
+        // 1. First refusal lowers once and writes capability-scoped `.err` marker with reason text.
+        let mut calls = 0usize;
+        let err1 = translated::cached_in(&dir, ident_v1, blob, Stage::Compute, 0, 1, false, true, || {
+            calls += 1;
+            Err(dxc::Failure::Rejected("image_atomic_add_64 is not supported".into()))
+        })
+        .err()
+        .unwrap();
+        assert_eq!(err1, "image_atomic_add_64 is not supported");
+        assert_eq!(calls, 1);
+
+        // 2. Second run with unchanged capability identity returns the identical reason with 0 lowerings.
+        let err2 = translated::cached_in(&dir, ident_v1, blob, Stage::Compute, 0, 1, false, true, || {
+            panic!("cached refusal must not re-lower")
+        })
+        .err()
+        .unwrap();
+        assert_eq!(err2, err1);
+
+        // 3. Changing wave mode (`split: true`) or translator source identity (`ident_v2`) invalidates
+        //    the marker and allows the shader to succeed cleanly.
+        let ok_split = translated::cached_in(&dir, ident_v1, blob, Stage::Compute, 0, 1, true, true, || {
+            Ok(compiled(3))
+        })
+        .unwrap();
+        assert_eq!(ok_split.dxil[0], 3);
+
+        let ok_v2 = translated::cached_in(&dir, ident_v2, blob, Stage::Compute, 0, 1, false, true, || {
+            Ok(compiled(4))
+        })
+        .unwrap();
+        assert_eq!(ok_v2.dxil[0], 4);
+
+        // 4. Disabled cache (`ident == 0`) bypasses negative markers completely.
+        let ok_disabled = translated::cached_in(&dir, 0, blob, Stage::Compute, 0, 1, false, true, || {
+            Ok(compiled(5))
+        })
+        .unwrap();
+        assert_eq!(ok_disabled.dxil[0], 5);
+
+        // 5. A deferred `cached_only` miss is never recorded as a permanent refusal.
+        let deferred_blob = b"console-shader-deferred";
+        let (res, missed) = dxc::cached_only(|| {
+            translated::cached_in(&dir, ident_v1, deferred_blob, Stage::Compute, 0, 1, false, true, || {
+                let dxil = dxc::compile_cached_in(&dir, "deferred probe", "main", "cs_6_6")?.0;
+                Ok(Compiled { dxil, samplers: Vec::new() })
+            })
+        });
+        assert!(res.is_err() && missed);
+        let ok_after_defer = translated::cached_in(&dir, ident_v1, deferred_blob, Stage::Compute, 0, 1, false, true, || {
+            Ok(compiled(6))
+        })
+        .unwrap();
+        assert_eq!(ok_after_defer.dxil[0], 6);
+
+        // 6. A transient DXC failure (e.g. OOM `0x8007000E`) formatted by `dxc.rs` is NOT cached
+        //    in `translated`, so the next call retries and succeeds; deterministic `: dxc: `
+        //    compile errors remain cached.
+        let transient_blob = b"console-shader-transient-dxc-oom";
+        let oom = translated::cached_in(&dir, ident_v1, transient_blob, Stage::Compute, 0, 1, false, true, || {
+            Err("DXIL cache C:\\cache\\0001.dxil (cs_6_6, entry \"main\", 128 B HLSL): Compile: E_OUTOFMEMORY (0x8007000E)".into())
+        })
+        .err()
+        .unwrap();
+        assert!(oom.contains("0x8007000E"));
+        let ok_after_oom = translated::cached_in(&dir, ident_v1, transient_blob, Stage::Compute, 0, 1, false, true, || {
+            Ok(compiled(7))
+        })
+        .unwrap();
+        assert_eq!(ok_after_oom.dxil[0], 7);
+
+        let lock_blob = b"shader with temporary cache lock failure";
+        let lock_error = translated::cached_in(&dir, ident_v1, lock_blob, Stage::Compute, 0, 1, false, true, || {
+            Err("DXIL cache: cannot create the cross-process mutex".into())
+        });
+        assert!(lock_error.is_err());
+        assert!(translated::cached_in(&dir, ident_v1, lock_blob, Stage::Compute, 0, 1, false, true, || Ok(compiled(9))).is_ok());
+
+        let dxc_err_blob = b"console-shader-deterministic-dxc-err";
+        let dxc_err1 = translated::cached_in(&dir, ident_v1, dxc_err_blob, Stage::Compute, 0, 1, false, true, || {
+            Err(dxc::Failure::Rejected("DXIL cache C:\\cache\\0002.dxil (cs_6_6, entry \"main\", 128 B HLSL): dxc: error: invalid op".into()))
+        })
+        .err()
+        .unwrap();
+        let dxc_err2 = translated::cached_in(&dir, ident_v1, dxc_err_blob, Stage::Compute, 0, 1, false, true, || {
+            panic!("deterministic DXC rejection must stay cached in translated")
+        })
+        .err()
+        .unwrap();
+        assert_eq!(dxc_err2, dxc_err1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

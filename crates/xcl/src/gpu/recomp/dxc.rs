@@ -364,12 +364,52 @@ fn compiler() -> Result<IDxcCompiler3, String> {
 /// be a game thread with a small stack. Reserved, committed only as used.
 const DXC_STACK: usize = 64 << 20;
 
+#[derive(Debug)]
+pub(super) enum Failure {
+    Rejected(String),
+    Retry(String),
+}
+
+impl Failure {
+    pub(super) fn message(self) -> String {
+        match self {
+            Self::Rejected(s) | Self::Retry(s) => s,
+        }
+    }
+
+    fn operation(status: HRESULT, diagnostic: &str) -> Self {
+        // E_FAIL alone is ambiguous. Require a source-located semantic error from DXC.
+        let mut lines = diagnostic.lines();
+        let first = lines.next().unwrap_or_default();
+        let line = if first == "error: validation errors" { lines.next().unwrap_or_default() } else { first };
+        let source_error = line.strip_prefix("hlsl.hlsl:").and_then(|line| line.split_once(": error: "))
+            .is_some_and(|(location, error)| {
+                location.split(':').all(|part| part.parse::<u32>().is_ok())
+                    && (error.starts_with("use of undeclared identifier '")
+                        || (error.starts_with("Declared Thread Group Z size ") && error.ends_with(" outside valid range [1..64].")))
+            });
+        if status == windows::Win32::Foundation::E_FAIL && source_error {
+            Self::Rejected(format!("dxc: {diagnostic}"))
+        } else {
+            Self::Retry(format!("dxc: {status:?}: {diagnostic}"))
+        }
+    }
+}
+
+impl From<String> for Failure {
+    fn from(s: String) -> Self { Self::Retry(s) }
+}
+
+impl From<&str> for Failure {
+    fn from(s: &str) -> Self { Self::Retry(s.into()) }
+}
+
 struct Job {
     src: String,
     entry: String,
     profile: String,
     extra: Vec<String>,
-    reply: std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
+    reply: std::sync::mpsc::Sender<Result<Vec<u8>, Failure>>,
     /// one of the title's threads waits for it
     wanted: Wanted,
 }
@@ -471,6 +511,10 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
 
 /// Compile HLSL to signed DXIL. `profile` e.g. "cs_6_6"; `extra` are dxc arguments.
 pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
+    compile_classified(src, entry, profile, extra).map_err(Failure::message)
+}
+
+fn compile_classified(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, Failure> {
     let (reply, rx) = std::sync::mpsc::channel();
     let job = Job { src: src.into(), entry: entry.into(), profile: profile.into(), extra: extra.iter().map(|s| s.to_string()).collect(), reply, wanted: crate::hle::d3d12x::pso_async::wanted_here() };
     pool().lock().unwrap().send(job).map_err(|_| "DXC: no compile threads".to_string())?;
@@ -496,7 +540,7 @@ pub(super) fn opt_level(len: usize) -> Option<&'static str> {
     }
 }
 
-fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
+fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, Failure> {
     let c = compiler()?;
     let mut args: Vec<Vec<u16>> = ["-E", entry, "-T", profile, "-HV", "2021"].iter().map(|a| crate::util::wide(a)).collect();
     if !extra.iter().any(|a| a.starts_with("-O")) {
@@ -512,12 +556,13 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
             let msg = r
                 .GetErrorBuffer()
                 .ok()
+                .filter(|b| b.GetBufferSize() != 0 && !b.GetBufferPointer().is_null())
                 .map(|b| {
                     let s = std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize());
                     String::from_utf8_lossy(s).trim_end_matches('\0').to_string()
                 })
                 .unwrap_or_default();
-            return Err(format!("dxc: {msg}"));
+            return Err(Failure::operation(status, &msg));
         }
         let blob: IDxcBlob = r.GetResult().map_err(|e| format!("{e}"))?;
         Ok(std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec())
@@ -649,7 +694,11 @@ pub(super) fn note_memory_hit() {
 /// `compile` through a disk cache in `dir` (big translated programs take seconds in DXC;
 /// the same console shader comes back every run). Returns (DXIL, from cache).
 pub fn compile_cached_in(dir: &Path, src: &str, entry: &str, profile: &str) -> Result<(Vec<u8>, bool), String> {
-    compile_cached_in_with(dir, src, entry, profile, || compile(src, entry, profile, &[]))
+    compile_cached_classified(dir, src, entry, profile).map_err(Failure::message)
+}
+
+pub(super) fn compile_cached_classified(dir: &Path, src: &str, entry: &str, profile: &str) -> Result<(Vec<u8>, bool), Failure> {
+    compile_cached_in_observed(dir, src, entry, profile, cache_counters(), || compile_classified(src, entry, profile, &[]))
 }
 
 type CacheFlight = (PathBuf, u64);
@@ -773,11 +822,42 @@ fn valid_dxil_container(blob: &[u8]) -> bool {
     has_dxil
 }
 
+#[cfg(test)]
 fn compile_cached_in_with<F>(dir: &Path, src: &str, entry: &str, profile: &str, compile_one: F) -> Result<(Vec<u8>, bool), String>
 where
-    F: FnOnce() -> Result<Vec<u8>, String>,
+    F: FnOnce() -> Result<Vec<u8>, Failure>,
 {
-    compile_cached_in_observed(dir, src, entry, profile, cache_counters(), compile_one)
+    compile_cached_in_observed(dir, src, entry, profile, cache_counters(), compile_one).map_err(Failure::message)
+}
+
+const ERR_MAGIC: &[u8; 8] = b"XCLDXCE2";
+const MAX_CACHED_ERR_BYTES: usize = 64 * 1024;
+
+pub(super) fn read_rejection(path: &Path, header: &[u8]) -> Option<String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    let limit = header.len() + 4 + MAX_CACHED_ERR_BYTES;
+    std::fs::File::open(path).ok()?.take(limit as u64 + 1).read_to_end(&mut bytes).ok()?;
+    let (size, msg) = bytes.strip_prefix(header)?.split_first_chunk::<4>()?;
+    let len = u32::from_le_bytes(*size) as usize;
+    if len == 0 || len > MAX_CACHED_ERR_BYTES || msg.len() != len {
+        return None;
+    }
+    String::from_utf8(msg.to_vec()).ok()
+}
+
+pub(super) fn store_rejection(path: &Path, header: &[u8], reason: &str) {
+    if reason.is_empty() || reason.len() > MAX_CACHED_ERR_BYTES {
+        return;
+    }
+    let Some(dir) = path.parent() else { return };
+    let mut bytes = header.to_vec();
+    bytes.extend_from_slice(&(reason.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(reason.as_bytes());
+    let tmp = path.with_extension(format!("err.{}.{:?}.tmp", std::process::id(), std::thread::current().id()));
+    if std::fs::create_dir_all(dir).is_ok() && std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 fn compile_cached_in_observed<F>(
@@ -787,16 +867,21 @@ fn compile_cached_in_observed<F>(
     profile: &str,
     counters: &CacheCounters,
     compile_one: F,
-) -> Result<(Vec<u8>, bool), String>
+) -> Result<(Vec<u8>, bool), Failure>
 where
-    F: FnOnce() -> Result<Vec<u8>, String>,
+    F: FnOnce() -> Result<Vec<u8>, Failure>,
 {
     let key = cache_key(src, entry, profile);
     let dir = normalized_cache_dir(dir);
     let file = dir.join(format!("{key:016x}.dxil"));
+    let err_file = dir.join(format!("{key:016x}.err"));
     if let Some(b) = cached_file(&file) {
         counters.hits.fetch_add(1, Ordering::Relaxed);
         return Ok((b, true));
+    }
+    let err_header = [*ERR_MAGIC, key.to_le_bytes(), (src.len() as u64).to_le_bytes()].concat();
+    if let Some(err) = read_rejection(&err_file, &err_header) {
+        return Err(Failure::Rejected(err));
     }
     // before the locks: a cached-only attempt (non-blocking pipeline creation) must not wait
     // for a worker compiling the same shader
@@ -814,30 +899,45 @@ where
         counters.coalesced_hits.fetch_add(1, Ordering::Relaxed);
         return Ok((b, true));
     }
+    if let Some(err) = read_rejection(&err_file, &err_header) {
+        return Err(Failure::Rejected(err));
+    }
     // A corrupt target must be removed before the atomic rename on Windows;
     // rename does not replace an existing file there.
     if file.is_file() {
         let _ = std::fs::remove_file(&file);
     }
     counters.compilations.fetch_add(1, Ordering::Relaxed);
-    let b = {
+    let raw_result = {
         let _active = Compiling::start();
         compile_one()
-    }
-    .and_then(|b| {
+    };
+    let b = match raw_result.and_then(|b| {
         if valid_dxil_container(&b) {
             Ok(b)
         } else {
             Err("DXIL cache: compiler returned an invalid DXIL container".into())
         }
-    })
-    .map_err(|e| {
-        counters.failure(format!(
-            "DXIL cache {} ({profile}, entry {entry:?}, {} B HLSL): {e}",
-            file.display(),
-            src.len()
-        ))
-    })?;
+    }) {
+        Ok(b) => b,
+        Err(e) => {
+            let cacheable = matches!(e, Failure::Rejected(_));
+            let e = e.message();
+            let formatted = counters.failure(format!(
+                "DXIL cache {} ({profile}, entry {entry:?}, {} B HLSL): {e}",
+                file.display(),
+                src.len()
+            ));
+            if cacheable {
+                store_rejection(&err_file, &err_header, &formatted);
+                return Err(Failure::Rejected(formatted));
+            }
+            return Err(Failure::Retry(formatted));
+        }
+    };
+    if err_file.is_file() {
+        let _ = std::fs::remove_file(&err_file);
+    }
     if std::fs::create_dir_all(&dir).is_ok() {
         // write to a temporary name first: another thread / process may be reading
         let tmp = file.with_extension(format!("tmp{}", std::process::id()));
@@ -934,8 +1034,8 @@ mod cache_tests {
         let _ = std::fs::remove_dir_all(&dir);
         let counters = CacheCounters::default();
         let src = "cache diagnostics";
-        let request = |compile_one: fn() -> Result<Vec<u8>, String>| {
-            compile_cached_in_observed(&dir, src, "shade", "ps_6_6", &counters, compile_one)
+        let request = |compile_one: fn() -> Result<Vec<u8>, Failure>| {
+            compile_cached_in_observed(&dir, src, "shade", "ps_6_6", &counters, compile_one).map_err(Failure::message)
         };
 
         let (r, missed) = cached_only(|| request(|| panic!("a cached-only miss must not compile")));
@@ -1255,5 +1355,100 @@ mod cache_tests {
             release_tx.send(()).unwrap();
             second_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         });
+    }
+
+    #[test]
+    fn dxc_status_resource_and_unknown_errors_retry() {
+        let diag = "hlsl.hlsl:2:6: error: use of undeclared identifier 'bad_op'";
+        for status in [0x8007000eu32, 0x80070005, 0x887a0005, 0x8000ffff] {
+            assert!(matches!(Failure::operation(HRESULT(status as i32), diag), Failure::Retry(_)));
+        }
+        for diagnostic in ["", "internal compiler failure", "out of memory"] {
+            assert!(matches!(Failure::operation(windows::Win32::Foundation::E_FAIL, diagnostic), Failure::Retry(_)));
+        }
+    }
+
+    #[test]
+    fn ordinary_dxc_source_rejection_is_recognized() {
+        if compiler().is_err() {
+            super::super::runner::skip_test("no DXC");
+            return;
+        }
+        let validation = compile_classified("[numthreads(1,1,1024)] void main() {}", "main", "cs_6_6", &[]).unwrap_err();
+        assert!(matches!(validation, Failure::Rejected(_)), "{validation:?}");
+        let err = compile_classified("float4 main() : SV_Target { return bad_op(); }", "main", "ps_6_6", &[]).unwrap_err();
+        assert!(matches!(err, Failure::Rejected(_)), "{err:?}");
+    }
+
+    #[test]
+    fn dxc_compile_failure_is_cached_and_skips_recompilation() {
+        let dir = std::env::temp_dir().join(format!("xcl-dxil-neg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let counters = CacheCounters::default();
+        let src = "float4 main() : SV_Target { return bad_op(); }";
+
+        // A confirmed source error is compiled once.
+        let first = compile_cached_in_observed(&dir, src, "main", "ps_6_6", &counters, || {
+            Err(Failure::operation(windows::Win32::Foundation::E_FAIL, "hlsl.hlsl:1:2: error: use of undeclared identifier 'bad_op'"))
+        })
+        .unwrap_err().message();
+        assert!(first.contains("undeclared identifier 'bad_op'"), "{first}");
+        assert_eq!(counters.snapshot().compilations, 1);
+        assert_eq!(counters.snapshot().compilation_failures, 1);
+
+        // 2. Subsequent runs (normal and cached_only) return the exact cached error with 0 compiles.
+        let second = compile_cached_in_observed(&dir, src, "main", "ps_6_6", &counters, || {
+            panic!("cached DXC failure must not invoke compiler again")
+        })
+        .unwrap_err().message();
+        assert_eq!(second, first);
+        let (probe, missed) = cached_only(|| {
+            compile_cached_in_observed(&dir, src, "main", "ps_6_6", &counters, || {
+                panic!("cached_only hit on DXC failure must not compile")
+            })
+        });
+        assert!(!missed);
+        assert_eq!(probe.unwrap_err().message(), first);
+        assert_eq!(counters.snapshot().compilations, 1);
+        assert_eq!(counters.snapshot().compilation_failures, 1);
+
+        // A valid container takes priority. A legacy rejection alone must be retried.
+        let key = cache_key(src, "main", "ps_6_6");
+        let file = dir.join(format!("{key:016x}.dxil"));
+        std::fs::write(&file, synthetic_dxil(3)).unwrap();
+        let (bytes, hit) = compile_cached_in_with(&dir, src, "main", "ps_6_6", || panic!("expected success hit")).unwrap();
+        assert!(hit);
+        assert_eq!(bytes, synthetic_dxil(3));
+        std::fs::remove_file(&file).unwrap();
+        let marker = file.with_extension("err");
+        let mut old = std::fs::read(&marker).unwrap();
+        old[..8].copy_from_slice(b"XCLDXCE1");
+        std::fs::write(&marker, old).unwrap();
+        let (_, hit) = compile_cached_in_with(&dir, src, "main", "ps_6_6", || Ok(synthetic_dxil(4))).unwrap();
+        assert!(!hit && !marker.exists());
+
+        // 3. Different profile/key misses the old marker and compiles cleanly.
+        let (dxil, hit) = compile_cached_in_observed(&dir, src, "main", "cs_6_6", &counters, || {
+            Ok(synthetic_dxil(7))
+        })
+        .unwrap();
+        assert!(!hit);
+        assert_eq!(dxil, synthetic_dxil(7));
+        assert_eq!(counters.snapshot().compilations, 2);
+
+        // 4. Transient non-DXC errors (e.g. missing DLL) are never cached.
+        let transient_src = "transient missing dxc";
+        let _ = compile_cached_in_observed(&dir, transient_src, "main", "cs_6_6", &counters, || {
+            Err("dxcompiler.dll not found".into())
+        })
+        .unwrap_err().message();
+        let (ok, hit) = compile_cached_in_observed(&dir, transient_src, "main", "cs_6_6", &counters, || {
+            Ok(synthetic_dxil(8))
+        })
+        .unwrap();
+        assert!(!hit);
+        assert_eq!(ok, synthetic_dxil(8));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
