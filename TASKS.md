@@ -123,3 +123,12 @@ Batch 9fa32a2 passed the workspace release build and full suite (798 passed incl
 - [ ] #1352 pixel sample-mask output, gpu/recomp/{emit,tests}.rs. At 07dd793 the contributor assertion and a 4x MSAA draw both passed after failing on the base. Per-sample readback changed from 240 wrong pixels out of 256 to zero. The initial review found missing-export and coverage-only bugs. At c74c2d2 the new fallback assertion passed, and the explicit masks passed RTX 4x readback. Claude approved the correction. Staged with #1351 for combined verification.
 
 - [ ] #1351, gpu/recomp/{emit,tests}.rs. Matched HLSL and GPU tests on the RTX 5070 went from 3 failures on the base to 3 passes on ddc6fb5. The 16x16 fixed-position draw went from 255 incorrect pixels to zero. In the 4x draw, 48 incorrect sample IDs and 60 incorrect positions out of 64 both went to zero. Codex approved; staged at 3224d77. The extra GPU probes were local validation.
+## November 24 batch and review decisions
+
+The fork at 24be5ac includes #1351 and corrected #1352. The workspace suite reported 809 passed, 0 failed and 41 ignored on the RTX 5070. The passed count includes two native-wave64 skips and one heap-window skip. The preceding 26d3222 retail checkpoint completed 60 seconds with 1,643 frames, 14,406 MB peak commit and no crash or device removal.
+
+- #1264 passed its focused ANSI directory test on 26d3222 with the contributor patch. The fixture failed at the first information level on the base with Windows error 3. Both levels passed with the patch. Claude approved after reviewing overlay handles and probing native Win32 behavior. Local integration candidate cd93cc5 awaits batch verification.
+- Hold #1154 at ea68eaa. Its fixture passed, but an infinite completion-port pump missed the termination callback in 200 of 200 idle-queue trials on candidate 3774b35. The polling pump received the callback.
+- Hold #1217 at 8933d64. Ordinary waiters passed ten repeated runs. Review identified a Windows loader-lock inversion when an initialized DLL loads another DLL from a thread notification. The fixture runs outside that callback.
+- Hold #1191 at d0211db. The successful two-page protection fixture passed. Review identified lost lazy-page state after allocation failure and a missed current-process handle case in VirtualProtectEx.
+- #573 addresses 54 compute shaders whose FSSM header selects wave32. All 54 compiled, eliminating 170 split-wave exchange sites. Review requested a header-boundary check and a portable wave32 test gate. Retail output for those shaders is unverified.
