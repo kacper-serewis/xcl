@@ -477,22 +477,30 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
     rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
 }
 
+/// The `-O` argument for a source of `len` bytes (None: DXC's default, -O3).
+///
+/// DXC's optimiser was superlinear on translated programs full of short-circuit `?:` /
+/// `&&` / `if` per instruction (a 1589-instruction console CS: ~6 min and > 30 GB at -O3).
+/// With branch-free emission (select / and / or) it is fast: that shader 0.3 s, a
+/// 15 720-instruction one 6 s (585 KB DXIL vs 1.6 MB at -O0, which the driver could not
+/// compile). -O0 only as a safety net for enormous sources.
+/// -O1 from 1 MB on: the same DXIL size at a quarter less time (a retail game's 4.8 MB HLSL of
+/// a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL)
+pub(super) fn opt_level(len: usize) -> Option<&'static str> {
+    if len > 8 * 1024 * 1024 {
+        Some("-O0")
+    } else if len > 1024 * 1024 {
+        Some("-O1")
+    } else {
+        None
+    }
+}
+
 fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let c = compiler()?;
     let mut args: Vec<Vec<u16>> = ["-E", entry, "-T", profile, "-HV", "2021"].iter().map(|a| crate::util::wide(a)).collect();
-    // DXC's optimiser was superlinear on translated programs full of short-circuit `?:` /
-    // `&&` / `if` per instruction (a 1589-instruction console CS: ~6 min and > 30 GB at -O3).
-    // With branch-free emission (select / and / or) it is fast: that shader 0.3 s, a
-    // 15 720-instruction one 6 s (585 KB DXIL vs 1.6 MB at -O0, which the driver could not
-    // compile). -O0 only as a safety net for enormous sources.
-    // -O1 from 1 MB on: the same DXIL size at a quarter less time (a retail game's 4.8 MB HLSL of
-    // a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL)
     if !extra.iter().any(|a| a.starts_with("-O")) {
-        if src.len() > 8 * 1024 * 1024 {
-            args.push(crate::util::wide("-O0"));
-        } else if src.len() > 1024 * 1024 {
-            args.push(crate::util::wide("-O1"));
-        }
+        args.extend(opt_level(src.len()).map(crate::util::wide));
     }
     args.extend(extra.iter().map(|a| crate::util::wide(a)));
     let ptrs: Vec<PCWSTR> = args.iter().map(|a| PCWSTR(a.as_ptr())).collect();

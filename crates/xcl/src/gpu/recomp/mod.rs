@@ -1512,9 +1512,49 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         }
         body.push_str(&code);
     }
-    let hlsl = em.finish(&body);
+    let mut hlsl = em.finish(&body);
+    drop(body);
+    // `split_wave64` is the adapter's: its wave32 programs are capped as well as the split ones
+    if opt.split_wave64 && matches!(opt.mode, Mode::Kernel | Mode::Compute(_)) {
+        hlsl = cap_indent(hlsl);
+    }
     let static_samplers = em.static_used.clone();
     Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers })
+}
+
+/// `hlsl` with at most 32 leading spaces per line, unless the smaller source would get another
+/// `-O` level from DXC (`dxc::opt_level`): then unchanged, so the cap never changes the level.
+/// That stays a function of the source, which keys the DXIL cache.
+fn cap_indent(hlsl: String) -> String {
+    let excess = |line: &str| line.bytes().take_while(|&b| b == b' ').count().saturating_sub(32);
+    let len = hlsl.len() - hlsl.split_inclusive('\n').map(excess).sum::<usize>();
+    if len == hlsl.len() || dxc::opt_level(len) != dxc::opt_level(hlsl.len()) {
+        return hlsl;
+    }
+    let mut out = String::with_capacity(len);
+    for line in hlsl.split_inclusive('\n') {
+        out.push_str(&line[excess(line)..]);
+    }
+    out
+}
+
+#[cfg(test)]
+mod indent_tests {
+    use super::*;
+
+    #[test]
+    fn indentation_cap_at_the_exact_dxc_limits() {
+        // 8 spaces too many, in a source of exactly `len` bytes
+        let source = |len: usize| format!("{}x;\n{}", " ".repeat(40), "y".repeat(len - 43));
+        for (limit, below, above) in [(1 << 20, None, Some("-O1")), (8 << 20, Some("-O1"), Some("-O0"))] {
+            for (len, level, capped) in [(limit, below, true), (limit + 1, above, false), (limit + 8, above, false), (limit + 9, above, true)] {
+                let src = source(len);
+                let out = cap_indent(src.clone());
+                assert_eq!((dxc::opt_level(len), dxc::opt_level(out.len())), (level, level), "{len}");
+                assert!(out == if capped { &src[8..] } else { &src }, "{len}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]

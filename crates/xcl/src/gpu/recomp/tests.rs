@@ -194,6 +194,111 @@ fn hlsl_is_generated_for_straight_line_and_branches() {
     let _ = Mode::Kernel;
 }
 
+/// `levels` nested ifs: s0 == k leaves at level k, else `moves` sets v1 = k + 1. Innermost, v1 += v2
+/// `adds` times.
+fn nested_ifs(levels: u64, moves: bool, adds: u64) -> Vec<u8> {
+    let mut code = Vec::new();
+    for level in 0..levels {
+        let skip = (2 + moves as u64) * (levels - level - 1) + moves as u64 + adds;
+        code.extend(encode("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128 + level)], None).unwrap());
+        code.extend(encode("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", skip)], None).unwrap());
+        if moves {
+            code.extend(encode("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 129 + level)], None).unwrap());
+        }
+    }
+    for _ in 0..adds {
+        code.extend(encode("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", V + 1), ("VSRC1", 2)], None).unwrap());
+    }
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    code
+}
+
+/// (widest indentation, total of the leading spaces past 32)
+fn indentation(hlsl: &str) -> (usize, usize) {
+    let spaces = |l: &str| l.len() - l.trim_start_matches(' ').len();
+    (hlsl.lines().map(spaces).max().unwrap(), hlsl.lines().map(|l| spaces(l).saturating_sub(32)).sum())
+}
+
+#[test]
+fn nested_compute_indentation_on_wave32_only_adapters() {
+    let levels = 24u64;
+    let code = nested_ifs(levels, true, 0);
+    let source = |mode: Mode, wave64, split_wave64| {
+        let t = translate(&code, &Options { mode, wave64, split_wave64, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported);
+        t.hlsl
+    };
+    // the adapter decides, not the guest's wave size: wave32 and split wave64 compute is capped
+    for wave64 in [false, true] {
+        for mode in [Mode::Kernel, Mode::Compute(super::CsInterface { threads: [64, 1, 1], ..Default::default() })] {
+            let native = source(mode.clone(), wave64, false);
+            let split = source(mode.clone(), wave64, true);
+            assert_eq!((indentation(&native).0, indentation(&split).0), (100, 32), "wave64 {wave64}, {mode:?}");
+            assert_eq!(split.matches("if (!(").count(), levels as usize);
+            if !wave64 {
+                // the split flag changes nothing else in a wave32 program
+                assert!(native.lines().map(str::trim_start).eq(split.lines().map(str::trim_start)));
+            }
+        }
+        for mode in [Mode::Mesh(Default::default()), Mode::Vertex(Default::default()), Mode::Pixel(Default::default())] {
+            assert_eq!(indentation(&source(mode, wave64, true)).0, 100);
+        }
+    }
+    if !gpu_ready() {
+        return;
+    }
+    let mut programs = vec![(false, source(Mode::Kernel, false, false)), (false, source(Mode::Kernel, false, true))];
+    if runner::split_wave64() {
+        programs.push((true, source(Mode::Kernel, true, true)));
+    }
+    let mut compiled = Vec::new();
+    for (wave64, src) in programs {
+        let dxil = super::dxc::compile(&src, "main", "cs_6_6", &[]).unwrap();
+        eprintln!("wave64 {wave64}: {} B HLSL, {} B DXIL, fnv {:016x}", src.len(), dxil.len(), crate::gpu::shader::fnv64(&dxil));
+        for stop in [0, 1, 8, 17, 23, 24, u32::MAX] {
+            let mut state = KernelState::default();
+            state.sgpr[0] = stop;
+            for (lane, regs) in state.vgpr.iter_mut().enumerate() {
+                regs[1] = 100 + lane as u32;
+            }
+            let r = runner::run(&dxil, &state, &[]).unwrap();
+            assert_eq!(r.scc, u32::from(stop < levels as u32));
+            for lane in 0..if wave64 { 64 } else { 32 } {
+                let expected = if stop == 0 { state.vgpr[lane][1] } else { stop.min(levels as u32) };
+                assert_eq!(r.vgpr[lane][1], expected, "wave64 {wave64}, stop {stop}, lane {lane}");
+            }
+        }
+        compiled.push(dxil);
+    }
+    assert_eq!(compiled[0], compiled[1]);
+}
+
+/// Programs of `adds` instructions 25 levels deep on a wave32-only adapter: DXC gets the level
+/// of the uncapped source, so one the cap would move to another level is not `capped`.
+fn check_capped_dxc_level(cases: &[(u64, Option<&str>, bool)]) {
+    for wave64 in [false, true] {
+        for &(adds, level, capped) in cases {
+            let t = translate(&nested_ifs(24, false, adds), &Options { wave64, split_wave64: true, ..Default::default() }).unwrap();
+            let (widest, excess) = indentation(&t.hlsl);
+            let got = super::dxc::opt_level(t.hlsl.len());
+            eprintln!("wave64 {wave64}, {adds} adds: {} B, {widest} spaces, {got:?}", t.hlsl.len());
+            assert_eq!((got, widest), (level, if capped { 32 } else { 100 }), "wave64 {wave64}, {adds} adds");
+            // (the case is what it is for)
+            assert!(capped || super::dxc::opt_level(t.hlsl.len() - excess) != level);
+        }
+    }
+}
+
+#[test]
+fn indentation_cap_keeps_the_dxc_level_at_1_mib() {
+    check_capped_dxc_level(&[(3000, None, true), (5000, Some("-O1"), false), (8000, Some("-O1"), true)]);
+}
+
+#[test]
+fn indentation_cap_keeps_the_dxc_level_at_8_mib() {
+    check_capped_dxc_level(&[(27_000, Some("-O1"), true), (30_000, Some("-O0"), false)]);
+}
+
 #[test]
 fn scalar_bfe_64_handles_unsigned_signed_and_zero_width() {
     let code = prog(&[
