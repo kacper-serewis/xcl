@@ -533,6 +533,8 @@ struct DecodedVoiceState {
     rate: u32,
     avg_bytes: u32,
     title_cb: usize,
+    /// The title submits XMA (not Opus): its BytesRequired is always 0
+    xma: bool,
     /// Maps stable token (`&*DecodedBuffer as usize`) → owned `DecodedBuffer`.
     live_buffers: Mutex<HashMap<usize, Box<DecodedBuffer>>>,
 }
@@ -572,10 +574,12 @@ unsafe fn title_cb_vtbl(cb: usize) -> Option<(*mut c_void, *const VoiceCallbackV
     Some((obj, vtbl))
 }
 
+/// `bytes` counts the PCM16 the Windows voice needs. For XMA the title submitted, BytesRequired
+/// is always 0 (IXAudio2VoiceCallback::OnVoiceProcessingPassStart docs); Opus keeps the count.
 unsafe extern "system" fn decoded_cb_pass_start(this: *mut c_void, bytes: u32) {
     let cb = &*(this as *const DecodedCallback);
     if let Some((obj, vt)) = title_cb_vtbl(cb.state.title_cb) {
-        ((*vt).pass_start)(obj, bytes);
+        ((*vt).pass_start)(obj, if cb.state.xma { 0 } else { bytes });
     }
 }
 
@@ -777,6 +781,7 @@ unsafe fn create_decoded_voice(
     label: &str,
 ) -> HRESULT {
     let pcm = pcm16_for_rate(channels, rate);
+    let xma = matches!(decoder, VoiceDecoder::Xma { .. });
     let state = Arc::new(DecodedVoiceState {
         decoder: Mutex::new(decoder),
         block_align,
@@ -784,6 +789,7 @@ unsafe fn create_decoded_voice(
         rate: pcm.rate,
         avg_bytes,
         title_cb: cb as usize,
+        xma,
         live_buffers: Mutex::new(HashMap::new()),
     });
     let wrapped_cb = Box::into_raw(Box::new(DecodedCallback {
@@ -1629,6 +1635,56 @@ mod tests {
             let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(vt_eng.add(2).read());
             release(eng);
         }
+    }
+
+    #[test]
+    fn decoded_voice_reports_no_bytes_required_to_the_title() {
+        static SEEN: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+        unsafe extern "system" fn on_pass_start(_: *mut c_void, bytes: u32) {
+            SEEN.store(bytes as usize, Ordering::SeqCst);
+        }
+        unsafe extern "system" fn on_nothing(_: *mut c_void) {}
+        unsafe extern "system" fn on_ctx(_: *mut c_void, _: *mut c_void) {}
+        unsafe extern "system" fn on_err(_: *mut c_void, _: *mut c_void, _: HRESULT) {}
+
+        static TEST_VTBL: VoiceCallbackVtbl = VoiceCallbackVtbl {
+            pass_start: on_pass_start,
+            pass_end: on_nothing,
+            stream_end: on_nothing,
+            buffer_start: on_ctx,
+            buffer_end: on_ctx,
+            loop_end: on_ctx,
+            voice_error: on_err,
+        };
+        #[repr(C)]
+        struct TestCb {
+            vtbl: &'static VoiceCallbackVtbl,
+        }
+        static TEST_CB: TestCb = TestCb { vtbl: &TEST_VTBL };
+
+        let f = xma2(2, 48_000, 0, 0x8000, 1);
+        let fmt = &f as *const Xma2WaveFormatEx as *const WaveFormatEx;
+        let (cfg, info) = unsafe { (xma_stream_config(fmt).unwrap().unwrap(), xma_info(fmt)) };
+        let decoder = VoiceDecoder::Xma { decoder: xma2::Decoder::new(cfg).unwrap(), info };
+        let state = Arc::new(DecodedVoiceState {
+            decoder: Mutex::new(decoder),
+            block_align: 1,
+            channels: 2,
+            rate: 48_000,
+            avg_bytes: 0,
+            title_cb: &TEST_CB as *const TestCb as usize,
+            xma: true,
+            live_buffers: Mutex::new(HashMap::new()),
+        });
+        let mut wrapped = DecodedCallback { vtbl: &DECODED_CALLBACK_VTBL, state };
+        // The Windows PCM16 voice asks for 1920 bytes (10 ms of 48 kHz stereo).
+        unsafe { (wrapped.vtbl.pass_start)(&mut wrapped as *mut DecodedCallback as *mut c_void, 1920) };
+        assert_eq!(SEEN.load(Ordering::SeqCst), 0);
+        // a voice that is not XMA (Opus) keeps the count
+        let mut opus = DecodedCallback { vtbl: &DECODED_CALLBACK_VTBL, state: Arc::new(DecodedVoiceState { xma: false, ..Arc::try_unwrap(wrapped.state).ok().unwrap() }) };
+        unsafe { (opus.vtbl.pass_start)(&mut opus as *mut DecodedCallback as *mut c_void, 1920) };
+        assert_eq!(SEEN.load(Ordering::SeqCst), 1920);
     }
 
     #[test]
