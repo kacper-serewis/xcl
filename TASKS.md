@@ -12,6 +12,6 @@ Base `9e3831e1f570d3646e53ab753b19ec07eb8f1485`. The supplied 1.0.2.1 pack trans
 - [ ] Measure contiguous CPU detile copies. PR #1512, `gpu/tiling.rs`. Run `cargo test -p xcl --lib detile_level_runs_match_elements` and compare timings on identical inputs with byte-for-byte equality.
 - [x] Align the memory-query test buffer. PR #656 at `d3e0b22`, integration `519c7c5`, `hle/kernelx.rs`. The focused test `xmem_virtual_query_marks_cpu_readable_memory` went from one failure to one pass. Full workspace 776 passed, 0 failed, 41 ignored, including three explicit skips.
 
-- [ ] Validate compute-list predication resource state. PR #1017, hle/d3d12x/list_x.rs. Run cargo test -p xcl predication and verify the compute-list state.
+- [ ] Validate compute-list predication resource state. PR #1017, hle/d3d12x/list_x.rs. Run cargo test -p xcl predication and verify the compute-list state. EXCLUDED. WARP accepted the base state 0x200 and rejected the proposed 0x40 with D3D12 debug error 538. The compute-list assertion also reported actual 64, expected 512.
 - [ ] Validate packed dot-product accumulator modifiers. PR #1286, gpu/recomp/{emit,tests}.rs. Run cargo test -p xcl --lib gpu_dot2_f32_f16_abs_neg_on_src2.
 - [ ] Share identical shader bytes between pipelines. PR #827, hle/d3d12x/real.rs. Run cargo test -p xcl --lib pipelines_with_the_same_shader_share_one_copy_of_its_bytes and verify distinct content remains distinct.
