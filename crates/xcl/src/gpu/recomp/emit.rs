@@ -33,6 +33,7 @@ pub(super) struct Em {
     pub ps_modes: BTreeMap<u32, String>,
     /// PS: an export with DONE was emitted (lanes without it are discarded)
     ps_done: bool,
+    ps_writes_mask: bool,
     /// LDS used (compute): declare the groupshared array
     uses_lds: bool,
     /// scratch_* used: declare the per-lane private memory
@@ -477,6 +478,7 @@ impl Em {
             dpp_enable: None,
             ps_modes: BTreeMap::new(),
             ps_done: false,
+            ps_writes_mask: false,
             uses_lds: false,
             uses_scratch: false,
             x64_words: 1,
@@ -1943,6 +1945,12 @@ impl Em {
             (Mode::Pixel(ps), 8) => {
                 if en & 1 == 1 && ps.outputs.iter().any(|e| matches!(e.system_value, 65 | 67 | 68)) {
                     st.push(format!("xo.xcl_depth = asfloat({});", srcs[0]));
+                }
+                // the sample mask: z of the 32-bit formats, VSRC1 [15:0] of the compressed one
+                // (Mesa, ac_nir_lower_ps_late.c, emit_ps_mrtz_export)
+                if enabled(2) && ps.outputs.iter().any(|e| e.system_value == 66) {
+                    self.ps_writes_mask = true;
+                    st.push(format!("xo.xcl_mask = {};", Self::exp_comp(srcs, compr, 2)));
                 }
             }
             (Mode::Pixel(_), 9) => {}
@@ -4683,13 +4691,17 @@ impl Em {
                         65 => h.push_str("    float xcl_depth : SV_Depth;\n"),
                         67 => h.push_str("    float xcl_depth : SV_DepthGreaterEqual;\n"),
                         68 => h.push_str("    float xcl_depth : SV_DepthLessEqual;\n"),
+                        66 if self.ps_writes_mask => h.push_str("    uint xcl_mask : SV_Coverage;\n"),
                         _ => {}
                     }
                 }
-                if !ps.outputs.iter().any(|e| matches!(e.system_value, 64 | 65 | 67 | 68)) {
+                if !self.ps_writes_mask && !ps.outputs.iter().any(|e| matches!(e.system_value, 64 | 65 | 67 | 68)) {
                     h.push_str("    float4 xcl_unused : SV_Target7;\n");
                 }
                 h.push_str("};\nXclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n    bool xcl_live = false;\n");
+                if self.ps_writes_mask {
+                    h.push_str("    xo.xcl_mask = 0xFFFFFFFFu;\n");
+                }
                 h.push_str(if self.opt.wave64 { "    lane_id = WaveGetLaneIndex();\n" } else { "    uint xcl_hw_lane = WaveGetLaneIndex();\n    xcl_w32 = WaveGetLaneCount() > 32u;\n    xcl_half = xcl_w32 ? xcl_hw_lane >> 5 : 0u;\n    lane_id = xcl_hw_lane & 31u;\n" });
                 if self.upper.is_some() {
                     h.push_str("    xcl_hw32 = WaveGetLaneCount() < 64u;\n");

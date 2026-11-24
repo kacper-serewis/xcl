@@ -7053,6 +7053,46 @@ fn gpu_mad_nf_f16_rounds_intermediate_in_binary16() {
     assert_eq!(r.vgpr[2][0], 0x0000, "mad_nf_f16 cancellation: (1+2^-10)^2-(1+2^-9) -> 0 (not 2^-20)");
 }
 
+/// `exp mrtz` carries the sample mask in z (32-bit formats; Mesa, ac_nir_lower_ps_late.c
+/// `emit_ps_mrtz_export`), or in the low half of VSRC1 when compressed (UINT16_ABGR): it goes
+/// to SV_Coverage when the console's output signature has one. A depth-only PS is as before.
+#[test]
+fn ps_mrtz_sample_mask_writes_sv_coverage() {
+    use super::PsInterface;
+    let ps = |outputs: Vec<crate::gpu::dxbc::SigElement>, mrtz: &[(&str, u64)]| {
+        let code = prog(&[
+            ("EXP", "ENC_EXP", mrtz, None),
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1), ("VM", 1)], None),
+        ]);
+        let psi = PsInterface { inputs: vec![], outputs, input_ena: 0x2, attrs: None };
+        let pt = translate(&code, &Options { mode: Mode::Pixel(psi), wave64: true, ..Default::default() }).unwrap();
+        assert!(pt.complete(), "{:?}\n{}", pt.unsupported_why, pt.hlsl);
+        if super::dxc::location().is_ok() {
+            super::dxc::compile(&pt.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", pt.hlsl));
+        }
+        pt.hlsl
+    };
+    let target = el("SV_Target", 0, 64, 3, 0, 0xF);
+    let h = ps(vec![target.clone(), el("SV_Coverage", 0, 66, 1, 0xFFFF_FFFF, 1)], &[("TGT", 8), ("EN", 0x4), ("VSRC2", 5)]);
+    assert!(h.contains("    uint xcl_mask : SV_Coverage;\n") && h.contains("xo.xcl_mask = v5;"), "{h}");
+    assert!(h.contains("xo.xcl_mask = 0xFFFFFFFFu;"), "a live path can bypass the mask export");
+    let mask = el("SV_Coverage", 0, 66, 1, 0xFFFF_FFFF, 1);
+    let h = ps(vec![target.clone(), mask.clone()], &[("TGT", 8), ("EN", 1), ("VSRC0", 4)]);
+    assert!(!h.contains("xcl_mask"), "a declaration alone must not introduce a coverage output");
+    let h = ps(vec![mask], &[("TGT", 8), ("EN", 4), ("VSRC2", 5), ("DONE", 1)]);
+    assert!(h.contains("xcl_mask : SV_Coverage") && !h.contains("SV_Target7"));
+    // compressed: the mask in VSRC1 [15:0] (EN 0xC)
+    let h = ps(vec![target.clone(), el("SV_Coverage", 0, 66, 1, 0xFFFF_FFFF, 1)], &[("TGT", 8), ("EN", 0xC), ("COMPR", 1), ("VSRC0", 6), ("VSRC1", 5)]);
+    assert!(h.contains("xo.xcl_mask = (v5 & 0xFFFFu);"), "{h}");
+    // no SV_Coverage in the signature: nothing written
+    let h = ps(vec![target.clone()], &[("TGT", 8), ("EN", 0x4), ("VSRC2", 5)]);
+    assert!(!h.contains("SV_Coverage") && !h.contains("xcl_mask"), "{h}");
+    // depth only: the interface and the depth write of before
+    let h = ps(vec![target, el("SV_Depth", 0, 65, 3, 0xFFFF_FFFF, 1)], &[("TGT", 8), ("EN", 0x1), ("VSRC0", 4)]);
+    assert!(h.contains("struct XclOut {\n    float4 t0 : SV_Target0;\n    float xcl_depth : SV_Depth;\n};\n"), "{h}");
+    assert!(h.contains("{ xo.xcl_depth = asfloat(v4); }") && !h.contains("xcl_mask"), "{h}");
+}
+
 #[test]
 fn ps_interp_p0_preserves_bits_and_p2_converts_to_float() {
     use super::PsInterface;
