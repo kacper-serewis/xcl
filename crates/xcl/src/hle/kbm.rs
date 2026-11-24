@@ -120,7 +120,7 @@ impl Wheel {
     }
 }
 
-/// The mouse buttons the title sees (bit 0 left, 1 right, 2 middle). A button already down
+/// The mouse buttons the title sees (bit 0 primary, 1 secondary, 2 middle). A button already down
 /// when the window gets the focus – the click that brings it to the front – is not pressed
 /// for the title until it is let go.
 #[derive(Debug, Default)]
@@ -155,6 +155,7 @@ extern "system" {
     fn GetClientRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
     fn ClientToScreen(hwnd: *mut c_void, point: *mut Point) -> i32;
     fn SetCursor(cursor: *mut c_void) -> *mut c_void;
+    fn GetSystemMetrics(index: i32) -> i32;
 }
 
 #[repr(C)]
@@ -213,6 +214,7 @@ const MOUSE_MOVE_ABSOLUTE: u16 = 1;
 const RI_MOUSE_WHEEL: u16 = 0x0400;
 const HTCLIENT: isize = 1;
 const MAPVK_VSC_TO_VK_EX: u32 = 3;
+const SM_SWAPBUTTON: i32 = 23;
 
 /// Physical AT Set 1 keyboard scancodes for the left-hand cluster, paired with their
 /// QWERTY virtual-key fallbacks if `MapVirtualKeyExW` returns 0.
@@ -376,6 +378,17 @@ fn key(vk: i32) -> bool {
     unsafe { GetAsyncKeyState(vk) as u16 & 0x8000 != 0 }
 }
 
+/// The virtual keys of the primary and the secondary mouse button. `GetAsyncKeyState` reads
+/// the physical buttons: with them swapped (left-handed, `SM_SWAPBUTTON`) the primary one is
+/// VK_RBUTTON.
+fn mouse_button_vks(swapped: bool) -> (i32, i32) {
+    if swapped {
+        (0x02, 0x01)
+    } else {
+        (0x01, 0x02)
+    }
+}
+
 /// Active keyboard layout (`HKL`) of `hwnd`'s thread, falling back to the current thread.
 fn keyboard_layout_for_window(hwnd: *mut c_void) -> *mut c_void {
     // SAFETY: `GetWindowThreadProcessId` and `GetKeyboardLayout` accept null/valid handles
@@ -443,8 +456,10 @@ pub fn apply(s: &mut GamepadState) {
     s.buttons |= SC_KEYS.iter().filter(|(sc, _)| sc_key(*sc)).fold(0, |b, (_, g)| b | g);
     let mut g = MOUSE.lock().unwrap_or_else(|e| e.into_inner());
     let m = g.get_or_insert_with(|| Mouse { last: Instant::now(), velocity: Velocity::default(), wheel: Wheel::default(), wheel_rest: 0, buttons: Buttons::default() });
-    // left / right / middle mouse button: right / left trigger, right stick click
-    let pressed = m.buttons.pressed(key(0x01) as u8 | (key(0x02) as u8) << 1 | (key(0x04) as u8) << 2);
+    // SAFETY: `GetSystemMetrics` takes any index and has no memory invariants.
+    let (primary, secondary) = mouse_button_vks(unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0);
+    // primary / secondary / middle mouse button: right / left trigger, right stick click
+    let pressed = m.buttons.pressed(key(primary) as u8 | (key(secondary) as u8) << 1 | (key(0x04) as u8) << 2);
     if pressed & 1 != 0 {
         s.right_trigger = 1.0;
     }
@@ -553,6 +568,14 @@ mod tests {
         assert_eq!(m.buttons.pressed(0b100), 0);
         assert_eq!(m.buttons.pressed(0b000), 0);
         assert_eq!(m.buttons.pressed(0b100), 0b100);
+    }
+
+    #[test]
+    fn swapped_mouse_buttons_keep_the_primary_on_the_right_trigger() {
+        // GetAsyncKeyState reads the physical buttons: VK_LBUTTON is the left one, swapped or not
+        assert_eq!(mouse_button_vks(false), (0x01, 0x02));
+        // swapped (left-handed), the primary button is the physical right one
+        assert_eq!(mouse_button_vks(true), (0x02, 0x01));
     }
 
     #[test]
