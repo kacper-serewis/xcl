@@ -3978,6 +3978,25 @@ fn ds_addtid_translates_with_m0_offset_and_lane_id() {
     assert!(!tg.hlsl.contains("groupshared uint xcl_lds"), "{}", tg.hlsl);
 }
 
+/// `GDS=1` on any LDS-memory DS instruction (not only the ADDTID forms) addresses the global
+/// data share, not the group's LDS: it is reported as unsupported and allocates no LDS.
+#[test]
+fn ds_gds_plain_forms_are_unsupported() {
+    for (op, fields) in [
+        ("DS_ADD_U32", &[("ADDR", 1), ("DATA0", 2), ("GDS", 1)][..]),
+        ("DS_WRITE_B32", &[("ADDR", 1), ("DATA0", 2), ("GDS", 1)][..]),
+        ("DS_READ_B32", &[("ADDR", 1), ("VDST", 3), ("GDS", 1)][..]),
+    ] {
+        let mut code = Vec::new();
+        code.extend(encode(op, "ENC_DS", fields, None).unwrap());
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let t = translate(&code, &Options::default()).unwrap();
+        assert_eq!(t.unsupported.get(op.to_lowercase().as_str()), Some(&1), "{op}: {:?}\n{}", t.unsupported, t.hlsl);
+        assert!(t.hlsl.contains("GDS"), "{op}: {}", t.hlsl);
+        assert!(!t.hlsl.contains("groupshared uint xcl_lds"), "{op}: {}", t.hlsl);
+    }
+}
+
 /// GPU verification for `DS_WRITE_ADDTID_B32` / `DS_READ_ADDTID_B32`: verifies exact LDS byte
 /// address (`M0[15:0] + ((OFFSET1 << 8) | OFFSET0) + 4 * lane_id`, ignoring `M0[31:16]`) in both
 /// directions against explicit `DS_READ_B32` / `DS_WRITE_B32`, plus EXEC masking on writes & reads.

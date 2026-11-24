@@ -3998,11 +3998,12 @@ impl Em {
             Mode::Geometry(g) => g.gs_start.is_some_and(|s| d.pc >= s),
             _ => false,
         };
+        // GDS=1: the access goes to the global data share, a separate memory, not the group's LDS
+        if f("GDS") != 0 {
+            return Err("GDS");
+        }
         // ADDTID forms have no ADDR VGPR: byte address = M0[15:0] + offset16 + 4 * lane_id.
         if matches!(name, "ds_write_addtid_b32" | "ds_read_addtid_b32") {
-            if f("GDS") != 0 {
-                return Err("GDS");
-            }
             self.uses_lds = true;
             let m0 = self.sreg(124);
             let at = format!("(({m0} & 0xFFFFu) + {off16}u + 4u * lane_id)");
